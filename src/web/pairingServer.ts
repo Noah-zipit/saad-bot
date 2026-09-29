@@ -90,7 +90,7 @@ const PAGE_HTML = `<!DOCTYPE html>
       <li>Tap <b>Link a device</b>, then <b>&ldquo;Link with phone number instead&rdquo;</b></li>
       <li>Type in the code above</li>
     </ol>
-    <p class="note">Only the latest code works — if it expires, just get a new one.</p>
+    <p class="note">Codes expire after about a minute — type it quickly. Only the latest code works.</p>
     <button id="again" class="ghost">Get a new code</button>
   </div>
 
@@ -146,6 +146,10 @@ const PAGE_HTML = `<!DOCTYPE html>
         codeEl.textContent = c.slice(0, 4) + ' – ' + c.slice(4);
         formWrap.hidden = true;
         codeWrap.hidden = false;
+      } else if (d.error === 'local-format') {
+        errEl.textContent = 'Drop the leading 0 — start with the country code instead.';
+      } else if (d.error === 'missing-country-code') {
+        errEl.textContent = 'That looks like a local number — add the country code at the front.';
       } else if (d.error === 'invalid-number') {
         errEl.textContent = 'Enter a valid number with country code (digits only).';
       } else if (d.error === 'not-connected') {
@@ -184,49 +188,25 @@ const PAGE_HTML = `<!DOCTYPE html>
  * inside Docker/Railway so the platform can route to it.
  */
 export function startPairingServer({ getSock, port, host = '127.0.0.1' }: PairingServerOptions): http.Server {
-  let readySock: WASocket | null = null
-  const listenersAttached = new WeakSet<object>()
-  let waiters: Array<() => void> = []
+  const READY_POLL_MS = 500
 
-  const flushWaiters = (): void => {
-    const pending = waiters
-    waiters = []
-    pending.forEach((fn) => fn())
-  }
+  /** Mask a phone number for logs: keep first/last 2 digits only. */
+  const maskNumber = (digits: string): string =>
+    digits.length <= 4 ? '****' : `${digits.slice(0, 2)}****${digits.slice(-2)}`
 
-  const ensureListener = (sock: WASocket): void => {
-    if (listenersAttached.has(sock)) return
-    listenersAttached.add(sock)
-    sock.ev.on('connection.update', (update) => {
-      if (update.connection === 'close') {
-        if (readySock === sock) readySock = null
-      } else {
-        // Any non-close update (qr / connecting / open) means the
-        // underlying WebSocket is live and can carry the pairing stanza.
-        readySock = sock
-        flushWaiters()
-      }
-    })
-  }
-
-  /** Resolves true once the live socket has an open WebSocket. */
-  const waitForReady = (): Promise<boolean> => {
-    const sock = getSock()
-    if (!sock) return Promise.resolve(false)
-    ensureListener(sock)
-    if (readySock === sock) return Promise.resolve(true)
-    return new Promise<boolean>((resolve) => {
-      const timer = setTimeout(() => {
-        waiters = waiters.filter((w) => w !== done)
-        resolve(false)
-      }, READY_TIMEOUT_MS)
-      const done = (): void => {
-        clearTimeout(timer)
-        const current = getSock()
-        resolve(current !== null && readySock === current)
-      }
-      waiters.push(done)
-    })
+  /**
+   * Resolves true once the live socket has an open WebSocket.
+   * Asks the CURRENT socket directly (sock.ws.isOpen) on every poll, so a
+   * reconnect that replaces the socket can never leave us watching a dead one.
+   */
+  const waitForReady = async (): Promise<boolean> => {
+    const start = Date.now()
+    for (;;) {
+      const sock = getSock()
+      if (sock?.ws?.isOpen) return true
+      if (Date.now() - start >= READY_TIMEOUT_MS) return false
+      await new Promise((r) => setTimeout(r, READY_POLL_MS))
+    }
   }
 
   const isRegistered = (): boolean => {
@@ -293,8 +273,18 @@ export function startPairingServer({ getSock, port, host = '127.0.0.1' }: Pairin
         }
 
         const digits = String(body.phoneNumber ?? '').replace(/\D/g, '')
+        // A LID or a local-format number produces a real-looking code bound
+        // to a number that is not the handset's — the phone then rejects it.
         if (digits.length < 8 || digits.length > 15) {
           sendJson(res, 400, { ok: false, error: 'invalid-number' })
+          return
+        }
+        if (digits.startsWith('0')) {
+          sendJson(res, 400, { ok: false, error: 'local-format' })
+          return
+        }
+        if (digits.length < 11) {
+          sendJson(res, 400, { ok: false, error: 'missing-country-code' })
           return
         }
         if (isRegistered()) {
@@ -302,8 +292,10 @@ export function startPairingServer({ getSock, port, host = '127.0.0.1' }: Pairin
           return
         }
 
+        console.log(`Pairing code requested for ${maskNumber(digits)}`)
         const ready = await waitForReady()
         if (!ready) {
+          console.log(`Pairing socket not ready for ${maskNumber(digits)}`)
           // Re-check: it may have linked while we waited.
           if (isRegistered()) sendJson(res, 409, { ok: false, error: 'already-linked' })
           else sendJson(res, 503, { ok: false, error: 'not-connected' })
@@ -316,10 +308,17 @@ export function startPairingServer({ getSock, port, host = '127.0.0.1' }: Pairin
             sendJson(res, 409, { ok: false, error: 'already-linked' })
             return
           }
-          const code = await sock.requestPairingCode(digits)
+          // requestPairingCode can hang indefinitely — cap it.
+          const code = await Promise.race([
+            sock.requestPairingCode(digits),
+            new Promise<never>((_, reject) =>
+              setTimeout(() => reject(new Error('pairing-code-timeout')), 15000)
+            )
+          ])
+          console.log(`Pairing code issued for ${maskNumber(digits)}`)
           sendJson(res, 200, { ok: true, code })
         } catch (err) {
-          console.error('Pairing code request failed:', err)
+          console.error(`Pairing code request failed for ${maskNumber(digits)}:`, err)
           sendJson(res, 500, { ok: false, error: 'pair-failed' })
         }
         return

@@ -1,4 +1,4 @@
-import { default as makeWASocket, useMultiFileAuthState, DisconnectReason } from '@whiskeysockets/baileys'
+import { default as makeWASocket, useMultiFileAuthState, DisconnectReason, Browsers } from '@whiskeysockets/baileys'
 import type { WASocket } from '@whiskeysockets/baileys'
 import type { Logger as PinoLogger, LoggerOptions } from 'pino'
 import { createRequire } from 'node:module'
@@ -110,7 +110,12 @@ export async function connectToWhatsApp(): Promise<WASocket> {
     logger,
     printQRInTerminal: true,
     auth: state,
-    browser: ['SaadBot', 'Chrome', '1.0.0']
+    // Browsers.macOS('Chrome') -> ['Mac OS','Chrome','14.4.1']. A custom
+    // browser[0] is not a known PlatformType, so WhatsApp 428s the connection.
+    browser: Browsers.macOS('Chrome'),
+    // Without this the socket is torn down 60s after the QR is issued
+    // ("QR refs attempts ended"), killing a pairing-code flow mid-typing.
+    qrTimeout: 300_000
   })
   sockHolder.current = sock
 
