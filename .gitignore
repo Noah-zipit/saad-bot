@@ -1,0 +1,8 @@
+node_modules/
+dist/
+sessions/
+.env
+*.log
+qr-capture.mjs
+data/
+.DS_Store
