@@ -7,6 +7,7 @@ import { loadPlugins } from './core/pluginLoader.js'
 import { cleanTmp } from './core/utils.js'
 import { participantPn } from './lib/jidUtils.js'
 import { startPairingServer } from './web/pairingServer.js'
+import { startAiBridge } from './core/aiBridge.js'
 import './config.js'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -152,6 +153,9 @@ async function init(): Promise<void> {
   const webPort = Number(process.env.WEB_PORT || process.env.PORT || 3000)
   const webHost = process.env.WEB_HOST || '127.0.0.1'
   startPairingServer({ getSock: () => sockHolder.current, port: webPort, host: webHost })
+
+  // AI bridge: deliver assistant answers for !ai queries back to WhatsApp
+  startAiBridge(() => sockHolder.current)
 
   // Clean temporary files every hour
   setInterval(cleanTmp, 3600000)

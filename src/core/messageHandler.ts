@@ -131,6 +131,13 @@ export async function handleMessage(message: WAMessage, sock: WASocket, db: Data
       const { pattern, handler, owner, admin, group, premium } = plugins[pluginId]
 
       if (pattern && pattern.test(command)) {
+        // Bot mode gate: in private mode only the owner may use commands
+        const botMode = (await db.getSetting('mode')) || 'public'
+        if (botMode === 'private' && !m.isOwner) {
+          m.reply('*🔒 Bot is in private mode*\n\nOnly the owner can use the bot right now.')
+          return
+        }
+
         // Check permissions
         if (owner && !m.isOwner) {
           m.reply('Only the owner can use this command.')
