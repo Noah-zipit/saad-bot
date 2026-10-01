@@ -47,7 +47,7 @@ const handler = async (m: ParsedMessage, { args }: CommandContext) => {
 }
 
 export default {
-  pattern: /^(meme|joke|funny|image)$/i,
+  pattern: /^(meme|joke|funny)$/i,
   handler,
   help: 'Get a random meme',
   usage: '!meme [category]',

@@ -1,16 +1,17 @@
-// src/commands/media/image.ts — resend a quoted/sent image at full size
-import type { ParsedMessage, CommandContext } from '../../core/types.js'
+// src/commands/media/image.ts — convert a sticker to an image, or resend a quoted/sent image at full size
+import sharp from 'sharp'
+import type { ParsedMessage, CommandContext, MediaDownloadResult } from '../../core/types.js'
 
 const handler = async (m: ParsedMessage, { sock }: CommandContext) => {
   try {
-    let mediaMsg: { type: string; download?: () => Promise<{ buffer?: Buffer } | null> } | undefined
+    let mediaMsg: { type: string; download?: () => Promise<MediaDownloadResult | null> } | undefined
 
-    if (m.type === 'imageMessage') {
+    if (['imageMessage', 'stickerMessage'].includes(m.type)) {
       mediaMsg = m
-    } else if (m.quoted && m.quoted.type === 'imageMessage') {
+    } else if (m.quoted && ['imageMessage', 'stickerMessage'].includes(m.quoted.type)) {
       mediaMsg = m.quoted
     } else {
-      return m.reply('🖼️ Reply to an image with *!image* (or send an image with caption *!image*) and I\'ll send it back at full size, no compression.')
+      return m.reply('🖼️ Reply to a sticker or image with *!image* (or send one with caption *!image*) and I\'ll convert it to an image.')
     }
 
     await m.reply(global.mess.wait)
@@ -18,7 +19,21 @@ const handler = async (m: ParsedMessage, { sock }: CommandContext) => {
     const media = await mediaMsg.download?.()
     const buffer = (media as any)?.buffer as Buffer | undefined
     if (!buffer || !buffer.length) {
-      return m.reply('❌ Could not download that image. Try again.')
+      return m.reply('❌ Could not download that media. Try again.')
+    }
+
+    if (mediaMsg.type === 'stickerMessage') {
+      // Stickers are webp (sometimes animated) — convert to a plain jpg image
+      const jpg = await sharp(buffer, { animated: true })
+        .flatten({ background: '#ffffff' })
+        .jpeg({ quality: 90 })
+        .toBuffer()
+      await sock.sendMessage(m.chat, {
+        image: jpg,
+        mimetype: 'image/jpeg',
+        caption: '🖼️ Sticker converted to image'
+      }, { quoted: m.message })
+      return
     }
 
     // Send as a document so WhatsApp does not recompress it — true full size
@@ -37,8 +52,8 @@ const handler = async (m: ParsedMessage, { sock }: CommandContext) => {
 export default {
   pattern: /^(image|fullimage|hdimage)$/i,
   handler,
-  help: 'Resend a quoted image at full size (no compression)',
-  usage: '!image (reply to an image)',
+  help: 'Convert a sticker to an image, or resend a quoted image at full size',
+  usage: '!image (reply to a sticker/image)',
   example: '!image',
   tags: ['media'],
   group: false,
