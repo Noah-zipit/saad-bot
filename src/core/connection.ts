@@ -19,8 +19,8 @@ import { decodeJid } from '../lib/jidUtils.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
-// Create sessions directory
-const sessionDir = path.join(__dirname, '../../sessions')
+// Create sessions directory (SESSION_DIR env isolates multiple instances)
+const sessionDir = process.env.SESSION_DIR || path.join(__dirname, '../../sessions')
 if (!fs.existsSync(sessionDir)) {
   fs.mkdirSync(sessionDir, { recursive: true })
 }

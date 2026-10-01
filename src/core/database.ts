@@ -5,7 +5,7 @@ import chalk from 'chalk'
 import { isLidJid, normalizePn, digitsOf } from '../lib/jidUtils.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const dataDir = path.join(__dirname, '../../data')
+const dataDir = process.env.DATA_DIR || path.join(__dirname, '../../data')
 
 export interface UserStats {
   commands: number
