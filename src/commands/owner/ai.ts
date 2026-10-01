@@ -7,7 +7,8 @@ import { fileURLToPath } from 'node:url'
 import type { ParsedMessage, CommandContext } from '../../core/types.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const INBOX = path.join(__dirname, '../../ai-inbox.jsonl')
+// Repo root (dist/commands/owner -> ../../..), same dir as ai-outbox.jsonl
+const INBOX = path.join(__dirname, '../../../ai-inbox.jsonl')
 
 const handler = async (m: ParsedMessage, { args }: CommandContext) => {
   const query = args.join(' ').trim()
