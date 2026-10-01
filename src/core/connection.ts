@@ -1,4 +1,10 @@
 import { default as makeWASocket, useMultiFileAuthState, DisconnectReason, Browsers } from '@whiskeysockets/baileys'
+import { HttpsProxyAgent } from 'https-proxy-agent'
+
+// Route the WhatsApp WebSocket through the sandbox egress proxy when one is
+// configured (the ws client does not honor proxy env vars on its own).
+const proxyUrl = process.env.https_proxy || process.env.HTTPS_PROXY || process.env.HTTP_PROXY || process.env.http_proxy
+const proxyAgent = proxyUrl ? new HttpsProxyAgent(proxyUrl) : undefined
 import type { WASocket } from '@whiskeysockets/baileys'
 import type { Logger as PinoLogger, LoggerOptions } from 'pino'
 import { createRequire } from 'node:module'
@@ -115,7 +121,11 @@ export async function connectToWhatsApp(): Promise<WASocket> {
     browser: Browsers.macOS('Chrome'),
     // Without this the socket is torn down 60s after the QR is issued
     // ("QR refs attempts ended"), killing a pairing-code flow mid-typing.
-    qrTimeout: 300_000
+    qrTimeout: 300_000,
+    // Sandbox egress proxy is very slow (~30s+ per WebSocket handshake);
+    // the 20s default would time out every attempt.
+    connectTimeoutMs: 120_000,
+    ...(proxyAgent ? { agent: proxyAgent } : {})
   })
   sockHolder.current = sock
 
