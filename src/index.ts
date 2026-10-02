@@ -150,9 +150,15 @@ async function init(): Promise<void> {
 
   // Pairing website: link WhatsApp with a phone number instead of QR
   // Railway injects PORT; WEB_PORT/WEB_HOST override for local or Docker use.
+  // The link page is non-essential once paired, so a bind failure must never
+  // crash the bot (the server itself also swallows EADDRINUSE).
   const webPort = Number(process.env.WEB_PORT || process.env.PORT || 3000)
   const webHost = process.env.WEB_HOST || '127.0.0.1'
-  startPairingServer({ getSock: () => sockHolder.current, port: webPort, host: webHost })
+  try {
+    startPairingServer({ getSock: () => sockHolder.current, port: webPort, host: webHost })
+  } catch (err) {
+    console.error('Pairing server failed to start (continuing without link page):', err)
+  }
 
   // AI bridge: deliver assistant answers for !ai queries back to WhatsApp
   startAiBridge(() => sockHolder.current)

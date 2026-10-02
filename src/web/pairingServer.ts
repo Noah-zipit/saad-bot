@@ -331,6 +331,19 @@ export function startPairingServer({ getSock, port, host = '127.0.0.1' }: Pairin
     }
   })
 
+  server.on('error', (err: NodeJS.ErrnoException) => {
+    // The link page is a convenience for one-time pairing; a bind failure
+    // (e.g. a stale process still holding the port during a watchdog
+    // restart) must never take the whole bot down. Log and keep running.
+    if (err && (err as NodeJS.ErrnoException).code === 'EADDRINUSE') {
+      console.error(
+        `Pairing server: port ${port} already in use — link page disabled, bot continues without it.`
+      )
+    } else {
+      console.error('Pairing server error:', err)
+    }
+  })
+
   server.listen(port, host, () => {
     console.log(`Link page: http://${host === '0.0.0.0' ? 'localhost' : host}:${port}`)
   })
