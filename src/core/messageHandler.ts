@@ -96,7 +96,8 @@ export async function handleMessage(message: WAMessage, sock: WASocket, db: Data
   m.senderRaw = rawSender
   m.senderPn = mappedPn
   m.sender = sender
-  m.isOwner = isOwner(m.sender)
+  // Messages sent from the bot's own linked device are the owner's own hands.
+  m.isOwner = isOwner(m.sender) || !!message.key.fromMe
 
   // Track message (canonical sender — stats follow the person, not the address form)
   await db.trackMessage(m.sender, m.chat)
