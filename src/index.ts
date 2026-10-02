@@ -21,19 +21,92 @@ if (!fs.existsSync(logsDir)) {
 
 const logFile = path.join(logsDir, `${new Date().toISOString().split('T')[0]}.log`)
 
+// Log rotation settings: keep daily files small so one noisy reconnect loop
+// can't eat the disk again (2026-10-01.log hit 1.8GB).
+const MAX_LOG_SIZE = 5 * 1024 * 1024 // 5MB per file before rotating
+const MAX_LOG_BACKUPS = 3            // keep .1, .2, .3
+const LOG_RETENTION_DAYS = 7         // delete logs older than 7 days on startup
+
+function rotateLogIfNeeded(): void {
+  try {
+    if (!fs.existsSync(logFile) || fs.statSync(logFile).size < MAX_LOG_SIZE) return
+    for (let i = MAX_LOG_BACKUPS - 1; i >= 1; i--) {
+      const older = `${logFile}.${i}`
+      const newer = `${logFile}.${i + 1}`
+      if (fs.existsSync(older)) fs.renameSync(older, newer)
+    }
+    fs.renameSync(logFile, `${logFile}.1`)
+  } catch (e) {
+    originalConsoleErrorSafe(e)
+  }
+}
+
+function originalConsoleErrorSafe(e: unknown): void {
+  try { process.stderr.write(`Log rotation failed: ${String(e)}\n`) } catch { /* ignore */ }
+}
+
+function pruneOldLogs(): void {
+  try {
+    const cutoff = Date.now() - LOG_RETENTION_DAYS * 24 * 3600 * 1000
+    for (const f of fs.readdirSync(logsDir)) {
+      if (!f.endsWith('.log') && !/\.log\.\d+$/.test(f)) continue
+      const p = path.join(logsDir, f)
+      try {
+        if (fs.statSync(p).mtimeMs < cutoff) fs.unlinkSync(p)
+      } catch { /* ignore */ }
+    }
+  } catch { /* ignore */ }
+}
+
+// Suppress bursts of identical consecutive log lines (e.g. Baileys reconnect
+// loops) — keep a count and write one summary line instead.
+let lastLogKey = ''
+let lastLogCount = 0
+let lastLogAt = 0
+const DEDUP_WINDOW_MS = 60 * 1000
+
+function flushSuppressed(prefix: string): void {
+  if (lastLogCount > 0) {
+    const timestamp = new Date().toISOString()
+    rotateLogIfNeeded()
+    fs.appendFileSync(logFile, `[${timestamp}] ${prefix}(previous line repeated ${lastLogCount} more time(s) within 60s)\n`)
+  }
+  lastLogCount = 0
+}
+
+function writeLogLine(prefix: string, message: string): void {
+  const now = Date.now()
+  const key = prefix + message
+  if (key === lastLogKey && now - lastLogAt < DEDUP_WINDOW_MS) {
+    lastLogCount++
+    lastLogAt = now
+    return
+  }
+  flushSuppressed(prefix)
+  lastLogKey = key
+  lastLogAt = now
+  const timestamp = new Date().toISOString()
+  rotateLogIfNeeded()
+  fs.appendFileSync(logFile, `[${timestamp}] ${prefix}${message}\n`)
+}
+
 // Initialize logging
 const originalConsoleLog = console.log
 const originalConsoleError = console.error
+
+pruneOldLogs()
+
+// Flush any pending duplicate-suppression summary before shutdown.
+process.on('exit', () => {
+  try { flushSuppressed('') } catch { /* ignore */ }
+})
 
 console.log = function (...args: unknown[]) {
   const message = args.map(arg =>
     typeof arg === 'object' ? JSON.stringify(arg) : arg
   ).join(' ')
 
-  const timestamp = new Date().toISOString()
-  const logMessage = `[${timestamp}] ${message}\n`
-
-  fs.appendFileSync(logFile, logMessage)
+  writeLogLine('', message)
   originalConsoleLog(...args)
 }
 
@@ -42,10 +115,7 @@ console.error = function (...args: unknown[]) {
     typeof arg === 'object' ? JSON.stringify(arg) : arg
   ).join(' ')
 
-  const timestamp = new Date().toISOString()
-  const logMessage = `[${timestamp}] ERROR: ${message}\n`
-
-  fs.appendFileSync(logFile, logMessage)
+  writeLogLine('ERROR: ', message)
   originalConsoleError(...args)
 }
 

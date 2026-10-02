@@ -74,7 +74,7 @@ const handler = async (m: ParsedMessage, { sock, db }: CommandContext) => {
 }
 
 export default {
-  pattern: /^(botstat|stats|status|info|devstat|sysstat)$/i,
+  pattern: /^(botstat|stat|stats|status|info|devstat|sysstat)$/i,
   handler,
   help: 'Live system diagnostics readout (owner only)',
   tags: ['owner'],
