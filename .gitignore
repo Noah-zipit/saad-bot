@@ -1,12 +1,78 @@
-node_modules/
-dist/
-sessions/
+# Dependencies and package-manager caches
+/node_modules/
+/.npm/
+/.pnpm-store/
+/.yarn/
+/.bun/
+
+# Package-manager and JavaScript-runtime lockfiles
+/package-lock.json
+/npm-shrinkwrap.json
+/yarn.lock
+/pnpm-lock.yaml
+/bun.lock
+/bun.lockb
+/deno.lock
+
+# Local environment and secrets (keep the checked-in example)
 .env
+.env.*
+!.env.example
+.secrets/
+/secrets/
+.npmrc
+.yarnrc
+.yarnrc.yml
+.pypirc
+.netrc
+credentials.json
+service-account*.json
+id_rsa
+id_dsa
+id_ecdsa
+id_ed25519
+id_ed25519_*
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Build and test output
+/dist/
+/build/
+/coverage/
+/.nyc_output/
+*.tsbuildinfo
+
+# Bot runtime data: WhatsApp credentials, user/group data, logs and media
+/sessions*/
+/data*/
+/logs/
+/tmp/
+/ai-inbox.jsonl
+/ai-outbox.jsonl
+/restart.marker
 *.log
-qr-capture.mjs
-data/
+*.log.*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.db
+*.db-*
+*.session
+
+# Temporary files and local captures
+*.tmp
+*.tmp.*
+*.bak
+*.swp
+*.swo
+/qr-capture.mjs
+
+# Operating system and editor files
 .DS_Store
-sessions2/
-data2/
-ai-inbox.jsonl
-ai-outbox.jsonl
+Thumbs.db
+Desktop.ini
+.idea/
+.vscode/
+.fleet/
