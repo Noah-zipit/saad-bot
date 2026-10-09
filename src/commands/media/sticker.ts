@@ -1,24 +1,34 @@
 import { Sticker } from 'wa-sticker-formatter'
+import { fileTypeFromBuffer } from 'file-type'
 import type { ParsedMessage, CommandContext, MediaDownloadResult } from '../../core/types.js'
+import { getStickerDefaults, parseNameArgs, rawArgsText } from '../../lib/stickerNames.js'
 
-const handler = async (m: ParsedMessage, { sock, args }: CommandContext) => {
+type MediaMsg = { type: string; download?: () => Promise<MediaDownloadResult | null> }
+
+function findMedia(m: ParsedMessage): MediaMsg | undefined {
+  if (m.type === 'imageMessage' || m.type === 'videoMessage') return m
+  if (m.quoted && (m.quoted.type === 'imageMessage' || m.quoted.type === 'videoMessage')) return m.quoted
+  return undefined
+}
+
+/**
+ * Convert image/video to sticker.
+ *
+ * Naming: !sticker My Pack | Ashar   (one-off override)
+ * Or save names once with !setname and every sticker carries them.
+ *
+ * Animated media (GIFs/videos) is resized to a full 512x512 canvas at high
+ * quality so it stays crisp instead of blurry.
+ */
+const handler = async (m: ParsedMessage, { sock, db }: CommandContext) => {
   try {
-    // Check if media message or quoted message
-    let mediaMsg: { type: string; download?: () => Promise<MediaDownloadResult | null> } | undefined
-
-    if (m.type === 'imageMessage' || m.type === 'videoMessage') {
-      mediaMsg = m
-    } else if (m.quoted && (m.quoted.type === 'imageMessage' || m.quoted.type === 'videoMessage')) {
-      mediaMsg = m.quoted
-    } else {
+    const mediaMsg = findMedia(m)
+    if (!mediaMsg) {
       return m.reply('Reply to an image or video to create a sticker, or send an image with caption *!sticker*')
     }
 
     // Show processing message
     await m.reply(global.mess.wait)
-
-    // Get media type
-    const isVideo = mediaMsg.type === 'videoMessage'
 
     // Download media
     const media = await mediaMsg.download?.()
@@ -26,14 +36,32 @@ const handler = async (m: ParsedMessage, { sock, args }: CommandContext) => {
       return m.reply('Failed to download media. Try again with a different image/video.')
     }
 
-    // Create sticker
+    // Animated detection: videos, GIFs and animated webp all keep their motion
+    let isAnimated = mediaMsg.type === 'videoMessage'
+    try {
+      const ft = await fileTypeFromBuffer(media.buffer)
+      if (ft && (ft.mime === 'image/gif' || ft.mime === 'image/webp' || ft.mime.startsWith('video'))) {
+        isAnimated = true
+      }
+    } catch {
+      // mime sniff failed — fall back to the message type
+    }
+
+    // Resolve names: inline override > saved defaults > built-in default
+    const dataDir = (db as unknown as { dataDir?: string }).dataDir || process.env.DATA_DIR || 'data'
+    const saved = getStickerDefaults(dataDir, m.sender)
+    const inline = parseNameArgs(rawArgsText(m.body, m.prefix))
+    const pack = (inline.pack || saved.pack).slice(0, 60)
+    const author = (inline.author || saved.author).slice(0, 60)
+
+    // Create sticker — animated ones get a full 512 canvas + high quality (no blur)
     const stickerOptions = {
-      pack: args[0] || 'Saad Bot',
-      author: args[1] || 'Saad Bot',
-      type: isVideo ? 'full' : 'default',
+      pack,
+      author,
+      type: isAnimated ? 'full' : 'default',
       categories: ['🌸', '⚔️'],
       id: Date.now().toString(),
-      quality: 70
+      quality: isAnimated ? 90 : 70
     }
 
     const sticker = new Sticker(media.buffer, stickerOptions as any)
@@ -52,7 +80,7 @@ const handler = async (m: ParsedMessage, { sock, args }: CommandContext) => {
 export default {
   pattern: /^(s|sticker|stiker|seal)$/i,
   handler,
-  help: 'Convert image/video to sticker',
+  help: 'Convert image/video to sticker (animated stays animated)',
   tags: ['media'],
   group: false,
   admin: false,
