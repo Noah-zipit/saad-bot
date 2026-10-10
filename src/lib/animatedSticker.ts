@@ -6,8 +6,11 @@
  * WhatsApp's ~500KB animated-sticker ceiling arrives as a static first
  * frame, and upscaling small GIFs to 512 blurred them. This encoder goes
  * straight from the source (mp4/gif/webp) to animated webp via ffmpeg's
- * libwebp_anim, never upscales small sources, and walks a quality ladder
- * until the output fits comfortably under the limit.
+ * libwebp_anim, never upscales small sources, and walks a ladder until the
+ * output fits comfortably under the limit. The ladder holds quality at 60+
+ * and sheds size via fps, then width, then duration — degrading quality
+ * never actually shrank motion content, it only produced the pixel
+ * distortion users reported.
  */
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
@@ -87,14 +90,22 @@ async function probeSourceFps(input: string): Promise<number | null> {
   return null
 }
 
-// Quality ladder: try the best first, degrade gracefully until it fits.
-type Attempt = { fps: number; quality: number; maxSeconds?: number }
+// Quality ladder: quality never drops below 60. That was the real bug:
+// for animated/motion content the -quality knob barely moves the output
+// size (a full-motion GIF encodes to ~2MB at q40 just as at q82), so
+// degrading quality only ever bought visible pixel distortion — never a
+// smaller file. Size is shed through fps, then width, then duration,
+// in that order. 8-10fps still looks smooth for sticker GIFs.
+type Attempt = { fps: number; quality: number; maxWidth: number; maxSeconds?: number }
 
 const LADDER: Attempt[] = [
-  { fps: 15, quality: 75 },
-  { fps: 12, quality: 60 },
-  { fps: 10, quality: 50 },
-  { fps: 10, quality: 40, maxSeconds: 4 },
+  { fps: 15, quality: 75, maxWidth: 512 },
+  { fps: 12, quality: 75, maxWidth: 512 },
+  { fps: 10, quality: 72, maxWidth: 512 },
+  { fps: 10, quality: 70, maxWidth: 448 },
+  { fps: 10, quality: 70, maxWidth: 384 },
+  { fps: 8, quality: 65, maxWidth: 320 },
+  { fps: 8, quality: 60, maxWidth: 320, maxSeconds: 4 },
 ]
 
 // NOTE: the fps step below DOWNSAMPLES only — never forces a low-fps GIF
@@ -120,12 +131,12 @@ export async function makeAnimatedSticker(input: Buffer, ext: string): Promise<B
 
     let smallest: Buffer | null = null
     for (const a of LADDER) {
-      const out = join(dir, `out-${a.fps}-${a.quality}${a.maxSeconds ? '-trim' : ''}.webp`)
-      // Never upscale: min(512,iw) keeps small GIFs at native resolution
+      const out = join(dir, `out-${a.fps}-${a.quality}-${a.maxWidth}${a.maxSeconds ? '-trim' : ''}.webp`)
+      // Never upscale: min(maxWidth,iw) keeps small GIFs at native resolution
       // (upscaling is what made them blurry). -2 keeps height even.
       const filters: string[] = []
       if (srcFps === null || srcFps > a.fps) filters.push(`fps=${a.fps}`)
-      filters.push(`scale='min(512,iw)':-2:flags=lanczos`)
+      filters.push(`scale='min(${a.maxWidth},iw)':-2:flags=lanczos`)
       const vf = filters.join(',')
       const args = ['-v', 'error', '-y', '-i', inp]
       if (a.maxSeconds) args.push('-t', String(a.maxSeconds))
@@ -134,6 +145,12 @@ export async function makeAnimatedSticker(input: Buffer, ext: string): Promise<B
         '-vcodec', 'libwebp_anim',
         '-lossless', '0',
         '-quality', String(a.quality),
+        // Conditional replenishment: skips re-encoding near-static blocks,
+        // so GIFs with still regions use fewer bytes and can stay on the
+        // early rungs. (It does nothing for full-motion content — for those
+        // the fps/width rungs below are what bring the size down.)
+        '-cr_threshold', '4',
+        '-cr_size', '16',
         '-loop', '0',
         '-an', '-vsync', '0',
         out

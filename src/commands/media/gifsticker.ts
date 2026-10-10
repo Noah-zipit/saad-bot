@@ -76,7 +76,11 @@ const handler = async (m: ParsedMessage, { sock, db }: CommandContext) => {
 
     await sock.sendMessage(m.chat, { sticker: stickerBuffer }, { quoted: m.message })
 
-    if (!animated) {
+    if (stickerBuffer.length > 490 * 1024) {
+      await m.reply(
+        'That GIF is very long or very busy — even the smallest clean encode is over WhatsApp\'s animated-sticker size, so it may arrive as a static image. Try a shorter or calmer clip and it should animate.'
+      )
+    } else if (!animated) {
       await m.reply('That did not look animated, so it went out as a normal sticker. Reply to a real GIF for motion.')
     }
   } catch (error) {
