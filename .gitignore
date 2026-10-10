@@ -10,3 +10,4 @@ sessions2/
 data2/
 ai-inbox.jsonl
 ai-outbox.jsonl
+tmp/
