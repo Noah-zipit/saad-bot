@@ -66,8 +66,17 @@ export async function addStickerMetadata(webp: Buffer, meta: StickerMetadata): P
   const img = new Image()
   await img.load(webp)
   img.exif = buildStickerExif(meta)
-  const out = await img.save(null)
-  return Buffer.from(out)
+  const out = Buffer.from(await img.save(null))
+  // node-webpmux recomputes the VP8X feature flags on save and drops the
+  // animation bit — WhatsApp then shows the sticker as a static image, which
+  // is why GIF stickers stopped moving once names were stamped in. Restore
+  // the source's original flags and set the EXIF bit (0x04) for the chunk
+  // we just appended.
+  const vp8x = out.indexOf('VP8X')
+  if (vp8x >= 0 && out.length > vp8x + 8 && webp.length > vp8x + 8) {
+    out[vp8x + 8] = webp[vp8x + 8] | 0x04
+  }
+  return out
 }
 
 /**
