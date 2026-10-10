@@ -67,15 +67,39 @@ export async function addStickerMetadata(webp: Buffer, meta: StickerMetadata): P
   return Buffer.from(out)
 }
 
-type Attempt = { fps: number; quality: number; maxSeconds?: number }
+/**
+ * Probe the source's average frame rate with ffprobe.
+ * Returns null when it can't be determined.
+ */
+async function probeSourceFps(input: string): Promise<number | null> {
+  try {
+    const { stdout } = await execFileAsync(
+      'ffprobe',
+      ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=avg_frame_rate',
+       '-of', 'default=nw=1:nk=1', input],
+      { timeout: 30_000 }
+    )
+    const [n, d] = stdout.trim().split('/').map(Number)
+    if (n > 0 && d > 0) return n / d
+  } catch {
+    // probe failed — fall through to the safe default below
+  }
+  return null
+}
 
 // Quality ladder: try the best first, degrade gracefully until it fits.
+type Attempt = { fps: number; quality: number; maxSeconds?: number }
+
 const LADDER: Attempt[] = [
   { fps: 15, quality: 75 },
   { fps: 12, quality: 60 },
   { fps: 10, quality: 50 },
   { fps: 10, quality: 40, maxSeconds: 4 },
 ]
+
+// NOTE: the fps step below DOWNSAMPLES only — never forces a low-fps GIF
+// up to the target rate. Duplicating frames to reach 15fps made stickers
+// visibly "double"/stutter and ate the bytes clarity needed.
 
 /**
  * Encode an animated source buffer (mp4 / gif / animated webp) into an
@@ -90,12 +114,19 @@ export async function makeAnimatedSticker(input: Buffer, ext: string): Promise<B
   await writeFile(inp, input)
 
   try {
+    // Probe once: knowing the source fps lets the fps filter downsample
+    // fast sources and pass slow ones through untouched (no frame doubling).
+    const srcFps = await probeSourceFps(inp)
+
     let smallest: Buffer | null = null
     for (const a of LADDER) {
       const out = join(dir, `out-${a.fps}-${a.quality}${a.maxSeconds ? '-trim' : ''}.webp`)
       // Never upscale: min(512,iw) keeps small GIFs at native resolution
       // (upscaling is what made them blurry). -2 keeps height even.
-      const vf = [`fps=${a.fps}`, `scale='min(512,iw)':-2:flags=lanczos`].join(',')
+      const filters: string[] = []
+      if (srcFps === null || srcFps > a.fps) filters.push(`fps=${a.fps}`)
+      filters.push(`scale='min(512,iw)':-2:flags=lanczos`)
+      const vf = filters.join(',')
       const args = ['-v', 'error', '-y', '-i', inp]
       if (a.maxSeconds) args.push('-t', String(a.maxSeconds))
       args.push(
