@@ -2,6 +2,7 @@ import { Sticker } from 'wa-sticker-formatter'
 import { fileTypeFromBuffer } from 'file-type'
 import type { ParsedMessage, CommandContext, MediaDownloadResult } from '../../core/types.js'
 import { getStickerDefaults, parseNameArgs, rawArgsText } from '../../lib/stickerNames.js'
+import { makeAnimatedSticker, addStickerMetadata } from '../../lib/animatedSticker.js'
 
 type MediaMsg = { type: string; download?: () => Promise<MediaDownloadResult | null> }
 
@@ -54,18 +55,29 @@ const handler = async (m: ParsedMessage, { sock, db }: CommandContext) => {
     const pack = (inline.pack || saved.pack).slice(0, 60)
     const author = (inline.author || saved.author).slice(0, 60)
 
-    // Create sticker — animated ones get a full 512 canvas + high quality (no blur)
-    const stickerOptions = {
-      pack,
-      author,
-      type: isAnimated ? 'full' : 'default',
-      categories: ['🌸', '⚔️'],
-      id: Date.now().toString(),
-      quality: isAnimated ? 90 : 70
+    // Animated sources go through the purpose-built encoder: it keeps the
+    // motion, stays under WhatsApp's ~500KB animated-sticker limit, and never
+    // upscales small GIFs (upscaling was the blur). Static images keep the
+    // wa-sticker-formatter path.
+    let stickerBuffer: Buffer
+    if (isAnimated) {
+      const ext = mediaMsg.type === 'videoMessage' ? '.mp4' : '.gif'
+      const raw = await makeAnimatedSticker(media.buffer, ext)
+      // Stamp the pack name back in — the ffmpeg encoder never wrote EXIF,
+      // which is why GIF stickers showed no name underneath.
+      stickerBuffer = await addStickerMetadata(raw, { id: Date.now().toString(), pack, author })
+    } else {
+      const stickerOptions = {
+        pack,
+        author,
+        type: 'default',
+        categories: ['🌸', '⚔️'],
+        id: Date.now().toString(),
+        quality: 70
+      }
+      const sticker = new Sticker(media.buffer, stickerOptions as any)
+      stickerBuffer = await sticker.toBuffer()
     }
-
-    const sticker = new Sticker(media.buffer, stickerOptions as any)
-    const stickerBuffer = await sticker.toBuffer()
 
     // Send sticker
     await sock.sendMessage(m.chat, { sticker: stickerBuffer }, { quoted: m.message })

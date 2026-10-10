@@ -2,6 +2,7 @@ import { Sticker } from 'wa-sticker-formatter'
 import { fileTypeFromBuffer } from 'file-type'
 import type { ParsedMessage, CommandContext, MediaDownloadResult } from '../../core/types.js'
 import { getStickerDefaults, parseNameArgs, rawArgsText } from '../../lib/stickerNames.js'
+import { makeAnimatedSticker, addStickerMetadata } from '../../lib/animatedSticker.js'
 
 type MediaMsg = { type: string; download?: () => Promise<MediaDownloadResult | null> }
 
@@ -53,16 +54,25 @@ const handler = async (m: ParsedMessage, { sock, db }: CommandContext) => {
     const pack = (inline.pack || saved.pack).slice(0, 60)
     const author = (inline.author || saved.author).slice(0, 60)
 
-    // Full 512x512 canvas, high quality, animation preserved → no blur
-    const sticker = new Sticker(media.buffer, {
-      pack,
-      author,
-      type: 'full',
-      categories: ['🌸', '⚔️'],
-      id: Date.now().toString(),
-      quality: 90
-    } as any)
-    const stickerBuffer = await sticker.toBuffer()
+    // Purpose-built animated encoder: keeps motion, stays under WhatsApp's
+    // ~500KB animated-sticker limit, never upscales small GIFs (no blur).
+    const ext = mediaMsg.type === 'videoMessage' ? '.mp4' : '.gif'
+    let stickerBuffer: Buffer
+    if (animated) {
+      const raw = await makeAnimatedSticker(media.buffer, ext)
+      // Stamp the pack name back in — the ffmpeg encoder never wrote EXIF,
+      // which is why GIF stickers showed no name underneath.
+      stickerBuffer = await addStickerMetadata(raw, { id: Date.now().toString(), pack, author })
+    } else {
+      stickerBuffer = await new Sticker(media.buffer, {
+        pack,
+        author,
+        type: 'default',
+        categories: ['🌸', '⚔️'],
+        id: Date.now().toString(),
+        quality: 70
+      } as any).toBuffer()
+    }
 
     await sock.sendMessage(m.chat, { sticker: stickerBuffer }, { quoted: m.message })
 
