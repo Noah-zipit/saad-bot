@@ -37,7 +37,31 @@ function writeAll(dataDir: string, all: Record<string, StickerNameDefaults>): vo
 
 export function getStickerDefaults(dataDir: string, sender: string): StickerNameDefaults {
   const all = readAll(dataDir)
-  return all[sender] || all['*'] || { ...DEFAULTS }
+  // A global '*' entry (set via `!setname all ...`) applies to every single
+  // number and takes precedence over per-number saves.
+  if (all['*']) return all['*']
+  return all[sender] || { ...DEFAULTS }
+}
+
+/** Read the global (every-number) pack/author override, if one is set. */
+export function getGlobalStickerDefaults(dataDir: string): StickerNameDefaults | undefined {
+  return readAll(dataDir)['*']
+}
+
+/** Set the global override: every number's stickers carry these names. */
+export function setGlobalStickerDefaults(dataDir: string, pack: string, author: string): void {
+  const all = readAll(dataDir)
+  all['*'] = { pack, author }
+  writeAll(dataDir, all)
+}
+
+/** Clear the global override; per-number saves (or defaults) take over again. */
+export function clearGlobalStickerDefaults(dataDir: string): boolean {
+  const all = readAll(dataDir)
+  if (!all['*']) return false
+  delete all['*']
+  writeAll(dataDir, all)
+  return true
 }
 
 export function setStickerDefaults(dataDir: string, sender: string, pack: string, author: string): void {

@@ -1,7 +1,7 @@
 import { Sticker } from 'wa-sticker-formatter'
 import { fileTypeFromBuffer } from 'file-type'
 import type { ParsedMessage, CommandContext, MediaDownloadResult } from '../../core/types.js'
-import { getStickerDefaults, setStickerDefaults, clearStickerDefaults, parseNameArgs, rawArgsText } from '../../lib/stickerNames.js'
+import { getStickerDefaults, setStickerDefaults, clearStickerDefaults, getGlobalStickerDefaults, setGlobalStickerDefaults, clearGlobalStickerDefaults, parseNameArgs, rawArgsText } from '../../lib/stickerNames.js'
 
 /**
  * Save your own sticker pack/author names once, and every !sticker / !gif
@@ -13,11 +13,52 @@ import { getStickerDefaults, setStickerDefaults, clearStickerDefaults, parseName
  *   !setname My Pack                pack only (author stays as saved)
  *   !setname                        show your current names
  *   !setname reset                  go back to the default names
+ *
+ * Global override (applies to every single number):
+ *   !setname all My Pack | Ashar    every sticker carries these names
+ *   !setname all                    show the global names
+ *   !setname all reset              clear the global names
  */
 const handler = async (m: ParsedMessage, { db }: CommandContext) => {
   try {
     const dataDir = (db as unknown as { dataDir?: string }).dataDir || process.env.DATA_DIR || 'data'
     const text = rawArgsText(m.body, m.prefix)
+
+    // --- Global override: `!setname all ...` ---
+    const allMatch = /^(all)(?:\s+(.*))?$/is.exec(text)
+    if (allMatch) {
+      const rest = (allMatch[2] || '').trim()
+
+      if (!rest) {
+        const g = getGlobalStickerDefaults(dataDir)
+        return m.reply(
+          g
+            ? `*Global sticker names* (every number):\n\nPack: *${g.pack}*\nAuthor: *${g.author}*\n\nChange with: !setname all <pack> | <author>\nClear with: !setname all reset`
+            : 'No global sticker names set.\n\nSet them with: !setname all <pack> | <author>\nExample: !setname all Saad | Saad'
+        )
+      }
+
+      if (/^(reset|clear|default)$/i.test(rest)) {
+        const had = clearGlobalStickerDefaults(dataDir)
+        return m.reply(
+          had
+            ? 'Global sticker names cleared — back to per-number names / defaults.'
+            : 'No global sticker names were set — nothing to clear.'
+        )
+      }
+
+      const { pack, author } = parseNameArgs(rest)
+      if (!pack) {
+        return m.reply('Usage: !setname all <pack> | <author>\nExample: !setname all Saad | Saad')
+      }
+      const prev = getGlobalStickerDefaults(dataDir)
+      const newPack = pack.slice(0, 60)
+      const newAuthor = (author || (prev && prev.author) || newPack).slice(0, 60)
+      setGlobalStickerDefaults(dataDir, newPack, newAuthor)
+      return m.reply(
+        `Done. From now on *every number's* stickers will carry:\n\nPack: *${newPack}*\nAuthor: *${newAuthor}*\n\n_This overrides any per-number !setname._`
+      )
+    }
 
     if (!text) {
       const saved = getStickerDefaults(dataDir, m.sender)
