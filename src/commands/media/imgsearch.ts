@@ -65,19 +65,23 @@ const handler = async (m: ParsedMessage, { sock, args }: CommandContext) => {
       return m.reply('❌ No images found for that search. Try different words.')
     }
 
-    const candidates: { url: string; title: string; source: string }[] = []
+    const candidates: { urls: string[]; title: string; source: string }[] = []
     for (const r of results) {
       const urls = [r.media_url, r.thumbnail_cdn_url].filter(
         (u): u is string => !!u && /^https?:\/\//i.test(u)
       )
       if (urls.length && candidates.length < MAX_IMAGES) {
-        candidates.push({ url: urls[0], title: r.title || query, source: r.page_url || '' })
+        candidates.push({ urls, title: r.title || query, source: r.page_url || '' })
       }
     }
 
     let sent = 0
     for (const c of candidates) {
-      const buf = await fetchImage(c.url)
+      let buf: Buffer | null = null
+      for (const url of c.urls) {
+        buf = await fetchImage(url)
+        if (buf) break
+      }
       if (!buf) continue
       const caption =
         `🔎 *${query}*\n` +
@@ -102,7 +106,7 @@ const handler = async (m: ParsedMessage, { sock, args }: CommandContext) => {
 }
 
 export default {
-  pattern: /^(img|imgsearch|imagesearch|searchimg|pic|pics)$/i,
+  pattern: /^(imh|img|imgsearch|imagesearch|searchimg|pic|pics)$/i,
   handler,
   help: 'Search the web for images by text and receive the pictures',
   usage: '!img <search text>',
