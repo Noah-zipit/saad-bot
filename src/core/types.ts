@@ -35,6 +35,8 @@ export interface ParsedMessage {
   prefix: string
   mentionedJid: string[]
   quoted?: ParsedQuoted
+  /** set when the incoming message is a view-once wrapper around media */
+  viewOnce?: { type: string; message: Record<string, any> }
   isOwner: boolean
   isAdmin: boolean
   isBotAdmin: boolean

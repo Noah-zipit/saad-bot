@@ -119,6 +119,38 @@ export async function handleMessage(message: WAMessage, sock: WASocket, db: Data
     return
   }
 
+  // --- Anti view-once: save incoming view-once photos/videos/voice notes and
+  // re-send them as normal messages so they stay viewable (owner asked for this).
+  if (m.viewOnce && ['imageMessage', 'videoMessage', 'audioMessage'].includes(m.viewOnce.type)) {
+    const avSetting = await db.getSetting('antiViewOnce')
+    if (avSetting?.enabled !== false) {
+      try {
+        const mediaWamsg = { key: message.key, message: m.viewOnce.message } as WAMessage
+        const dl = await downloadToTmp(mediaWamsg, m.viewOnce.type)
+        if (dl) {
+          const kind = m.viewOnce.type.replace('Message', '').toLowerCase()
+          const note = `👁 *View-once saved* — from ${m.pushName}\n_This ${kind} was view-once; kept here as a normal message._`
+          if (m.viewOnce.type === 'imageMessage') {
+            await sock.sendMessage(m.chat, { image: dl.buffer, caption: note })
+          } else if (m.viewOnce.type === 'videoMessage') {
+            await sock.sendMessage(m.chat, { video: dl.buffer, caption: note })
+          } else {
+            const innerAudio = (m.viewOnce.message as Record<string, any>).audioMessage ?? {}
+            await sock.sendMessage(m.chat, {
+              audio: dl.buffer,
+              mimetype: innerAudio.mimetype || 'audio/ogg; codecs=opus',
+              ptt: true
+            })
+            await sock.sendMessage(m.chat, { text: note })
+          }
+          console.log(`[anti-viewonce] saved ${kind} from ${digitsOf(m.sender)} in ${m.chat}`)
+        }
+      } catch (e) {
+        console.error('[anti-viewonce] failed:', e)
+      }
+    }
+  }
+
   // Process command if this is a command
   const prefix = global.prefix || '!'
   if (m.body && m.body.startsWith(prefix)) {
@@ -189,6 +221,15 @@ async function parseMessage(message: WAMessage, sock: WASocket): Promise<ParsedM
 
   const type = types[0] ?? ''
   let body = ''
+
+  // Unwrap view-once messages so the inner media can be seen/downloaded
+  let viewOnce: { type: string; message: Record<string, any> } | undefined
+  if (['viewOnceMessage', 'viewOnceMessageV2', 'viewOnceMessageV2Extension'].includes(type)) {
+    const wrapped = ((inner as Record<string, any>)[type]?.message ?? {}) as Record<string, any>
+    const innerType = Object.keys(wrapped)[0] ?? ''
+    if (innerType) viewOnce = { type: innerType, message: { [innerType]: wrapped[innerType] } }
+  }
+
   if (type === 'conversation') {
     body = inner.conversation || ''
   } else if (type === 'extendedTextMessage') {
@@ -256,6 +297,7 @@ async function parseMessage(message: WAMessage, sock: WASocket): Promise<ParsedM
     prefix,
     mentionedJid,
     quoted,
+    viewOnce,
     isOwner: false,
     isAdmin: false,
     isBotAdmin: false,
