@@ -17,10 +17,14 @@
  *     one at 384px/10fps/q70 every time — and every major sticker app trims
  *     to a short loop anyway. GIFs are left alone (they are already short).
  *  2. The ladder starts at quality 88 and holds 512px/15fps through the first
- *     three rungs, shedding size via fps, then width, then duration — in that
- *     order. Quality is the LAST thing sacrificed, never the first. (Earlier
+ *     five rungs, stepping quality down in 2-point increments (88/86/84/82/80)
+ *     so mid-busy content lands on a higher rung instead of jumping 88->84->80.
+ *     Size is then shed via fps, then width, then duration — in that order.
+ *     Quality is the LAST thing sacrificed, never the first. (Earlier
  *     versions started at q75 and dropped to 448px by rung 4 on ordinary
  *     busy phone video — that was the "badly encoded" look.)
+ *  3. The byte ceiling is 480KB — safely under WhatsApp's ~500KB rejection
+ *     line, ~7% more budget than the old 450KB, worth roughly one rung.
  *  3. Deeper rungs exist for pathological content, but trimming happens
  *     before resolution/fps collapse, so the common case never sees them.
  */
@@ -34,8 +38,10 @@ const { Image } = webpmux
 
 const execFileAsync = promisify(execFile)
 
-// WhatsApp's animated-sticker ceiling is ~500KB; stay comfortably under it.
-const MAX_BYTES = 450 * 1024
+// WhatsApp rejects animated stickers near ~500KB; 480KB keeps a safe
+// margin while giving the encoder ~7% more byte budget than the old 450KB,
+// which is roughly one quality rung on mid-busy content.
+const MAX_BYTES = 480 * 1024
 
 // Videos longer than this are trimmed to their first N seconds before the
 // quality ladder runs. Duration dominates output size for video, so this is
@@ -164,7 +170,9 @@ type Attempt = { fps: number; quality: number; maxWidth: number; maxSeconds?: nu
 
 const LADDER: Attempt[] = [
   { fps: 15, quality: 88, maxWidth: 512 },
+  { fps: 15, quality: 86, maxWidth: 512 },
   { fps: 15, quality: 84, maxWidth: 512 },
+  { fps: 15, quality: 82, maxWidth: 512 },
   { fps: 15, quality: 80, maxWidth: 512 },
   { fps: 12, quality: 80, maxWidth: 512 },
   { fps: 12, quality: 78, maxWidth: 448 },
