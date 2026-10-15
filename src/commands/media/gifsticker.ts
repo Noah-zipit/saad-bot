@@ -2,7 +2,7 @@ import { Sticker } from 'wa-sticker-formatter'
 import { fileTypeFromBuffer } from 'file-type'
 import type { ParsedMessage, CommandContext, MediaDownloadResult } from '../../core/types.js'
 import { getStickerDefaults, parseNameArgs, rawArgsText } from '../../lib/stickerNames.js'
-import { makeAnimatedSticker, addStickerMetadata } from '../../lib/animatedSticker.js'
+import { makeAnimatedSticker, addStickerMetadata, validateAnimatedSticker, sourceToGifVideo } from '../../lib/animatedSticker.js'
 
 type MediaMsg = { type: string; download?: () => Promise<MediaDownloadResult | null> }
 
@@ -74,10 +74,28 @@ const handler = async (m: ParsedMessage, { sock, db }: CommandContext) => {
       } as any).toBuffer()
     }
 
+    // Safety net (2026-10-16): never hand the phone a sticker it cannot
+    // display. If the encoded sticker fails structural validation, fall
+    // back to sending the source as a normal looping GIF — visible always
+    // beats an invisible sticker.
+    if (animated) {
+      const check = validateAnimatedSticker(stickerBuffer)
+      if (!check.ok || stickerBuffer.length > 512 * 1024) {
+        console.warn(`[gif] sticker failed validation (${check.reason || 'oversize'}), falling back to gif video`)
+        try {
+          const gifVideo = await sourceToGifVideo(media.buffer, ext)
+          await sock.sendMessage(m.chat, { video: gifVideo, gifPlayback: true }, { quoted: m.message })
+          await m.reply('That one would not display as a sticker, so I sent it as a normal GIF instead.')
+        } catch {
+          await m.reply('Failed to turn that into a sticker. Make sure it is a GIF under ~10MB and try again.')
+        }
+        return
+      }
+    }
+
     await sock.sendMessage(m.chat, { sticker: stickerBuffer }, { quoted: m.message })
 
-    if (stickerBuffer.length > 490 * 1024) {
-      await m.reply(
+    if (stickerBuffer.length > 490 * 1024) {      await m.reply(
         'That GIF is very long or very busy — even the smallest clean encode is over WhatsApp\'s animated-sticker size, so it may arrive as a static image. Try a shorter or calmer clip and it should animate.'
       )
     } else if (!animated) {

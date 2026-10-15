@@ -103,10 +103,82 @@ export async function addStickerMetadata(webp: Buffer, meta: StickerMetadata): P
   return out
 }
 
+/**
+ * Structural validation for an encoded animated sticker.
+ * Walks the RIFF chunk list and confirms: valid WEBP container, size field
+ * matches the buffer, VP8X present with the animation bit set, an ANIM
+ * chunk, and at least two ANMF frames. Anything failing this is something
+ * a phone cannot display — the caller must not send it as a sticker.
+ */
+export interface StickerValidation {
+  ok: boolean
+  reason?: string
+}
+
+export function validateAnimatedSticker(buf: Buffer): StickerValidation {
+  if (buf.length < 32) return { ok: false, reason: 'too small' }
+  if (buf.subarray(0, 4).toString('latin1') !== 'RIFF' || buf.subarray(8, 12).toString('latin1') !== 'WEBP') {
+    return { ok: false, reason: 'not a webp container' }
+  }
+  if (buf.readUInt32LE(4) + 8 !== buf.length) return { ok: false, reason: 'truncated file' }
+  let off = 12
+  let hasAnim = false
+  let frames = 0
+  while (off + 8 <= buf.length) {
+    const fourcc = buf.subarray(off, off + 4).toString('latin1')
+    if (!/^[\x20-\x7e]{4}$/.test(fourcc)) return { ok: false, reason: 'corrupt chunk header' }
+    const size = buf.readUInt32LE(off + 4)
+    if (off + 8 + size > buf.length) return { ok: false, reason: 'chunk overruns file' }
+    if (fourcc === 'VP8X') {
+      if (size < 10) return { ok: false, reason: 'bad VP8X chunk' }
+      if (!(buf[off + 8] & 0x10)) return { ok: false, reason: 'animation flag missing' }
+    } else if (fourcc === 'ANIM') {
+      hasAnim = true
+    } else if (fourcc === 'ANMF') {
+      frames++
+    }
+    off += 8 + size + (size & 1)
+  }
+  if (off !== buf.length) return { ok: false, reason: 'trailing garbage' }
+  if (!hasAnim) return { ok: false, reason: 'no animation chunk' }
+  if (frames < 2) return { ok: false, reason: 'fewer than 2 frames' }
+  return { ok: true }
+}
+
 interface SourceProbe {
   fps: number | null
   duration: number | null
   format: string | null
+}
+
+/**
+ * Last-resort path for the !gif command: if the encoded sticker ever fails
+ * structural validation (something the phone cannot display), the caller
+ * sends the source back as a plain looping GIF video instead of a broken
+ * sticker. A visible GIF always beats an invisible sticker.
+ */
+export async function sourceToGifVideo(input: Buffer, ext: string): Promise<Buffer> {
+  const dir = await mkdtemp(join(tmpdir(), 'gifvideo-'))
+  const safeExt = ext.startsWith('.') ? ext : `.${ext}`
+  const inp = join(dir, `in${safeExt}`)
+  const out = join(dir, 'out.mp4')
+  await writeFile(inp, input)
+  try {
+    await execFileAsync(
+      'ffmpeg',
+      [
+        '-v', 'error', '-y', '-i', inp,
+        '-vf', "scale='min(512,iw)':-2",
+        '-pix_fmt', 'yuv420p',
+        '-movflags', '+faststart',
+        '-an', out
+      ],
+      { timeout: 120_000 }
+    )
+    return await readFile(out)
+  } finally {
+    await rm(dir, { recursive: true, force: true }).catch(() => {})
+  }
 }
 
 /**
