@@ -6,7 +6,7 @@
  * WhatsApp's ~500KB animated-sticker ceiling arrives as a static first
  * frame, and upscaling small GIFs to 512 blurred them. This encoder goes
  * straight from the source (mp4/gif/webp) to animated webp via ffmpeg's
- * libwebp_anim, never upscales small sources, and walks a ladder until the
+ * upscaling small sources to 512 with lanczos at encode time, and walks a ladder until the
  * output fits comfortably under the limit.
  *
  * Quality strategy (2026-10-15 rework — "video stickers are not crystal
@@ -16,6 +16,11 @@
  *     ladder. A crisp 5s sticker at 512px/15fps/q84 beats a mushy full-length
  *     one at 384px/10fps/q70 every time — and every major sticker app trims
  *     to a short loop anyway. GIFs are left alone (they are already short).
+ *  1b. UPSCALE RULE (2026-10-16, "gifs are still looking really bad"): small
+ *     GIFs are lanczos-upscaled to 512 at encode time. Sending a 240px webp
+ *     and letting the phone's scaler blow it up ~3x is what made GIF
+ *     stickers look smeared; the upscale costs bytes (the ladder's duration
+ *     rung absorbs it) but the edges stay crisp.
  *  2. The ladder starts at quality 88 and holds 512px/15fps through the first
  *     five rungs, stepping quality down in 2-point increments (88/86/84/82/80)
  *     so mid-busy content lands on a higher rung instead of jumping 88->84->80.
@@ -329,11 +334,19 @@ export async function makeAnimatedSticker(input: Buffer, ext: string): Promise<B
       if (key === lastKey) continue
       lastKey = key
       const out = join(dir, `out-${a.fps}-${a.quality}-${a.maxWidth}${trim ? '-trim' : ''}.webp`)
-      // Never upscale: min(maxWidth,iw) keeps small GIFs at native resolution
-      // (upscaling is what made them blurry). -2 keeps height even.
+      // Upscale small sources to the rung's long-side target with lanczos.
+      // The earlier "never upscale" rule backfired: a 240px GIF sticker is
+      // upscaled ~3x by the phone's own (cheap bilinear-ish) scaler at
+      // display time and comes out smeared — that was the persistent "GIFs
+      // look really bad" complaint. Encode-time lanczos upscale to 512
+      // keeps edges crisp; measured side-by-side, text and shapes stay
+      // readable where the display-time upscale smears them. -2 keeps the
+      // proportional side even.
       const filters: string[] = []
       if (probe.fps === null || probe.fps > a.fps) filters.push(`fps=${a.fps}`)
-      filters.push(`scale='min(${a.maxWidth},iw)':-2:flags=lanczos`)
+      filters.push(
+        `scale='if(gt(iw,ih),${a.maxWidth},-2)':'if(gt(iw,ih),-2,${a.maxWidth})':flags=lanczos`
+      )
       const vf = filters.join(',')
       const args = ['-v', 'error', '-y', '-i', encodeInput]
       if (trim !== undefined) args.push('-t', String(trim))

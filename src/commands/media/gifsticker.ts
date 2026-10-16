@@ -55,7 +55,8 @@ const handler = async (m: ParsedMessage, { sock, db }: CommandContext) => {
     const author = (inline.author || saved.author).slice(0, 60)
 
     // Purpose-built animated encoder: keeps motion, stays under WhatsApp's
-    // ~500KB animated-sticker limit, never upscales small GIFs (no blur).
+    // ~500KB animated-sticker limit, upscales small GIFs to 512 at encode
+    // time so they stay crisp instead of smearing in the phone's scaler.
     const ext = mediaMsg.type === 'videoMessage' ? '.mp4' : '.gif'
     let stickerBuffer: Buffer
     if (animated) {
