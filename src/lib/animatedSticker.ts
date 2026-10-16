@@ -19,13 +19,17 @@
  *  2. The ladder starts at quality 88 and holds 512px/15fps through the first
  *     five rungs, stepping quality down in 2-point increments (88/86/84/82/80)
  *     so mid-busy content lands on a higher rung instead of jumping 88->84->80.
- *     Size is then shed via fps, then width, then duration — in that order.
- *     Quality is the LAST thing sacrificed, never the first. (Earlier
- *     versions started at q75 and dropped to 448px by rung 4 on ordinary
- *     busy phone video — that was the "badly encoded" look.)
+ *     When quality alone cannot fit the 480KB ceiling, size is shed via
+ *     DURATION next (a crisp 2s loop at 15fps), then fps, then width — in
+ *     that order. Dropping to 8-10fps is what made stickers look like they
+ *     were "buffering", so fps never goes below 12: smooth short motion
+ *     beats long jerky motion every time. Quality is the LAST thing
+ *     sacrificed, never the first. (Earlier versions started at q75 and
+ *     dropped to 448px by rung 4 on ordinary busy phone video — that was
+ *     the "badly encoded" look.)
  *  3. The byte ceiling is 480KB — safely under WhatsApp's ~500KB rejection
  *     line, ~7% more budget than the old 450KB, worth roughly one rung.
- *  3. Deeper rungs exist for pathological content, but trimming happens
+ *  4. Deeper rungs exist for pathological content, but trimming happens
  *     before resolution/fps collapse, so the common case never sees them.
  */
 import { execFile } from 'node:child_process'
@@ -169,6 +173,11 @@ export async function sourceToGifVideo(input: Buffer, ext: string): Promise<Buff
       [
         '-v', 'error', '-y', '-i', inp,
         '-vf', "scale='min(512,iw)':-2",
+        // Explicit quality: the x264 default (crf 23, medium) came out soft
+        // and WhatsApp's own recompress on top turned it blocky. crf 20
+        // gives headroom for that second compression; veryfast keeps the
+        // encode quick on large sources.
+        '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20',
         '-pix_fmt', 'yuv420p',
         '-movflags', '+faststart',
         '-an', out
@@ -234,10 +243,13 @@ function isVideoSource(probe: SourceProbe, ext: string): boolean {
 // Quality ladder: quality is the LAST thing sacrificed, never the first.
 // Earlier versions opened at q75 and were already down to 448px/10fps by
 // rung 4 on ordinary busy phone video — that was the "badly encoded" look
-// users reported. Now the first three rungs hold full 512px/15fps and walk
-// quality down from 88; size is then shed through fps, then width, then
-// duration, in that order. Deep rungs exist only for pathological content —
-// the 5s pre-trim above keeps real videos on the early rungs.
+// users reported. The next failure mode was the fps floor at 8: busy GIFs
+// collapsed to 8-10fps and played back jerky, "like something buffering",
+// plus the pixelation from the 320-384px rungs. Now the first five rungs
+// hold full 512px/15fps and walk quality down from 88; size is then shed
+// through DURATION (a 2s loop is still a loop), then fps (floor 12 — never
+// 8/10), then width, in that order. Deep rungs exist only for pathological
+// content — the 5s pre-trim above keeps real videos on the early rungs.
 type Attempt = { fps: number; quality: number; maxWidth: number; maxSeconds?: number }
 
 const LADDER: Attempt[] = [
@@ -246,12 +258,12 @@ const LADDER: Attempt[] = [
   { fps: 15, quality: 84, maxWidth: 512 },
   { fps: 15, quality: 82, maxWidth: 512 },
   { fps: 15, quality: 80, maxWidth: 512 },
-  { fps: 12, quality: 80, maxWidth: 512 },
-  { fps: 12, quality: 78, maxWidth: 448 },
-  { fps: 10, quality: 78, maxWidth: 448 },
-  { fps: 10, quality: 75, maxWidth: 384 },
-  { fps: 8, quality: 72, maxWidth: 384, maxSeconds: 4 },
-  { fps: 8, quality: 68, maxWidth: 320, maxSeconds: 3 },
+  { fps: 15, quality: 80, maxWidth: 512, maxSeconds: 2 },
+  { fps: 15, quality: 78, maxWidth: 512, maxSeconds: 2 },
+  { fps: 12, quality: 78, maxWidth: 512, maxSeconds: 2 },
+  { fps: 12, quality: 75, maxWidth: 448, maxSeconds: 2 },
+  { fps: 12, quality: 72, maxWidth: 384, maxSeconds: 2 },
+  { fps: 12, quality: 68, maxWidth: 320, maxSeconds: 2 },
 ]
 
 // NOTE: the fps step below DOWNSAMPLES only — never forces a low-fps GIF
@@ -302,8 +314,21 @@ export async function makeAnimatedSticker(input: Buffer, ext: string): Promise<B
     }
 
     let smallest: Buffer | null = null
+    let lastKey = ''
     for (const a of LADDER) {
-      const out = join(dir, `out-${a.fps}-${a.quality}-${a.maxWidth}${a.maxSeconds ? '-trim' : ''}.webp`)
+      // Only trim when the source is actually longer than the rung's cap —
+      // a maxSeconds rung on an already-short GIF would just re-encode the
+      // identical output and waste time.
+      const trim =
+        a.maxSeconds !== undefined &&
+        probe.duration !== null &&
+        probe.duration > a.maxSeconds
+          ? a.maxSeconds
+          : undefined
+      const key = `${a.fps}/${a.quality}/${a.maxWidth}/${trim ?? ''}`
+      if (key === lastKey) continue
+      lastKey = key
+      const out = join(dir, `out-${a.fps}-${a.quality}-${a.maxWidth}${trim ? '-trim' : ''}.webp`)
       // Never upscale: min(maxWidth,iw) keeps small GIFs at native resolution
       // (upscaling is what made them blurry). -2 keeps height even.
       const filters: string[] = []
@@ -311,7 +336,7 @@ export async function makeAnimatedSticker(input: Buffer, ext: string): Promise<B
       filters.push(`scale='min(${a.maxWidth},iw)':-2:flags=lanczos`)
       const vf = filters.join(',')
       const args = ['-v', 'error', '-y', '-i', encodeInput]
-      if (a.maxSeconds) args.push('-t', String(a.maxSeconds))
+      if (trim !== undefined) args.push('-t', String(trim))
       args.push(
         '-vf', vf,
         '-vcodec', 'libwebp_anim',

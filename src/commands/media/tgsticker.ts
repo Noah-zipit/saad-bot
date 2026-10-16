@@ -1,15 +1,41 @@
 import { Sticker } from 'wa-sticker-formatter'
 import type { ParsedMessage, CommandContext } from '../../core/types.js'
+import { getStickerDefaults, hasCustomStickerNames } from '../../lib/stickerNames.js'
+import { makeAnimatedSticker, addStickerMetadata } from '../../lib/animatedSticker.js'
 
 const MAX_STICKERS = 10
 const TELEGRAM_FILE_URL = 'https://api.telegram.org/file/bot'
+
+/**
+ * Fetch with retries — api.telegram.org occasionally goes slow or drops
+ * requests (seen 2026-10-15: HeadersTimeoutError on both attempts), so a
+ * single timeout must not kill the whole pack download.
+ */
+async function tgFetch(url: string, label: string): Promise<Response> {
+  let lastError: unknown = null
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), 60_000)
+    try {
+      const res = await fetch(url, { signal: controller.signal })
+      clearTimeout(timer)
+      return res
+    } catch (e) {
+      clearTimeout(timer)
+      lastError = e
+      console.error(`tgsticker: ${label} attempt ${attempt} failed`, (e as Error)?.message || e)
+      if (attempt < 3) await new Promise(r => setTimeout(r, attempt * 3000))
+    }
+  }
+  throw lastError
+}
 
 /**
  * Download a Telegram sticker pack as WhatsApp stickers.
  * Usage: !tgsticker <telegram sticker pack link>
  * Requires TELEGRAM_BOT_TOKEN in the environment (any bot from @BotFather works).
  */
-const handler = async (m: ParsedMessage, { sock, args }: CommandContext) => {
+const handler = async (m: ParsedMessage, { sock, args, db }: CommandContext) => {
   const token = process.env.TELEGRAM_BOT_TOKEN
   if (!token) {
     return m.reply(
@@ -40,7 +66,7 @@ const handler = async (m: ParsedMessage, { sock, args }: CommandContext) => {
     await m.reply(global.mess.wait)
 
     // 1. Fetch the sticker set metadata
-    const setRes = await fetch(`https://api.telegram.org/bot${token}/getStickerSet?name=${encodeURIComponent(packName)}`)
+    const setRes = await tgFetch(`https://api.telegram.org/bot${token}/getStickerSet?name=${encodeURIComponent(packName)}`, 'getStickerSet')
     const setData = await setRes.json() as { ok: boolean; description?: string; result?: { name: string; title: string; stickers: any[] } }
     if (!setData.ok || !setData.result) {
       return m.reply(
@@ -55,14 +81,16 @@ const handler = async (m: ParsedMessage, { sock, args }: CommandContext) => {
 
     // 2. Resolve file paths (Telegram downloads require the bot token)
     const targets = stickers.slice(0, MAX_STICKERS)
-    const resolved: { fileId: string; url: string; animated: boolean }[] = []
+    const resolved: { fileId: string; url: string; animated: boolean; ext: string }[] = []
     for (const st of targets) {
       const fileId = st.file_id as string
       const isAnimated = st.is_animated === true || st.is_video === true
-      const fileRes = await fetch(`https://api.telegram.org/bot${token}/getFile?file_id=${encodeURIComponent(fileId)}`)
+      const fileRes = await tgFetch(`https://api.telegram.org/bot${token}/getFile?file_id=${encodeURIComponent(fileId)}`, 'getFile')
       const fileData = await fileRes.json() as { ok: boolean; result?: { file_path: string } }
       if (fileData.ok && fileData.result?.file_path) {
-        resolved.push({ fileId, url: `${TELEGRAM_FILE_URL}${token}/${fileData.result.file_path}`, animated: isAnimated })
+        const filePath = fileData.result.file_path
+        const ext = (filePath.split('.').pop() || 'webm').toLowerCase()
+        resolved.push({ fileId, url: `${TELEGRAM_FILE_URL}${token}/${filePath}`, animated: isAnimated, ext })
       }
     }
 
@@ -72,23 +100,53 @@ const handler = async (m: ParsedMessage, { sock, args }: CommandContext) => {
 
     await m.reply(`*Pack:* ${title}\nSending ${resolved.length} sticker${resolved.length > 1 ? 's' : ''} — tap any sticker and star it to add it to your WhatsApp collection ⭐`)
 
+    // Sticker branding: honor his saved !setname names (per-sender, or the
+    // global `!setname all` override). If he never saved names, keep the
+    // Telegram pack title + a neutral author line.
+    const dataDir = (db as unknown as { dataDir?: string }).dataDir || process.env.DATA_DIR || 'data'
+    let packNameLabel: string
+    let authorLabel: string
+    if (hasCustomStickerNames(dataDir, m.sender)) {
+      const saved = getStickerDefaults(dataDir, m.sender)
+      packNameLabel = saved.pack
+      authorLabel = saved.author
+    } else {
+      packNameLabel = title.slice(0, 60) || 'Telegram Pack'
+      authorLabel = 'Telegram → WhatsApp'
+    }
+
     // 3. Download + convert each sticker and send it
     let sent = 0
     for (const file of resolved) {
       try {
-        const dl = await fetch(file.url)
+        const dl = await tgFetch(file.url, 'sticker file download')
         if (!dl.ok) continue
         const buffer = Buffer.from(await dl.arrayBuffer())
 
-        const sticker = new Sticker(buffer, {
-          pack: title.slice(0, 60) || 'Telegram Pack',
-          author: 'Telegram → WhatsApp',
-          type: file.animated ? 'full' : 'default',
-          categories: ['🌸'],
-          id: `${Date.now()}-${file.fileId}`,
-          quality: 70
-        } as any)
-        const stickerBuffer = await sticker.toBuffer()
+        let stickerBuffer: Buffer
+        if (file.animated && file.ext !== 'tgs') {
+          // Video stickers: route through the purpose-built animated encoder.
+          // wa-sticker-formatter's video path emits multi-MB webps, which
+          // WhatsApp rejects (animated ceiling ~500KB); the ladder below
+          // keeps the output playable.
+          stickerBuffer = await makeAnimatedSticker(buffer, '.' + file.ext)
+          stickerBuffer = await addStickerMetadata(stickerBuffer, {
+            id: `${Date.now()}-${file.fileId}`,
+            pack: packNameLabel,
+            author: authorLabel,
+            emojis: ['🌸']
+          })
+        } else {
+          const sticker = new Sticker(buffer, {
+            pack: packNameLabel,
+            author: authorLabel,
+            type: file.animated ? 'full' : 'default',
+            categories: ['🌸'],
+            id: `${Date.now()}-${file.fileId}`,
+            quality: 70
+          } as any)
+          stickerBuffer = await sticker.toBuffer()
+        }
 
         await sock.sendMessage(m.chat, { sticker: stickerBuffer })
         sent++
@@ -104,12 +162,16 @@ const handler = async (m: ParsedMessage, { sock, args }: CommandContext) => {
       : ''
 
     await m.reply(
-      `*Done.* Sent ${sent} sticker${sent === 1 ? '' : 's'} from *${title}*.\n\n` +
+      `*Done.* Sent ${sent} sticker${sent === 1 ? '' : 's'} from *${title}*.\n` +
+      `They carry your pack name — *${packNameLabel}* by *${authorLabel}*.\n\n` +
       `To add them to your WhatsApp sticker collection, tap a sticker → Add to favorites ⭐.${totalNote}`
     )
   } catch (error) {
     console.error('Error in tgsticker command:', error)
-    m.reply('Saad Bot failed to fetch that Telegram sticker pack. Check the link and try again.')
+    m.reply(
+      'Saad Bot couldn\'t reach Telegram just now (its servers are being slow). ' +
+      'Try the command again in a minute — I retry a few times automatically before giving up.'
+    )
   }
 }
 

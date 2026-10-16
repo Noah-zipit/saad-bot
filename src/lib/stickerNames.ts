@@ -48,6 +48,12 @@ export function getGlobalStickerDefaults(dataDir: string): StickerNameDefaults |
   return readAll(dataDir)['*']
 }
 
+/** True when a custom name was explicitly saved (per-sender or global override). */
+export function hasCustomStickerNames(dataDir: string, sender: string): boolean {
+  const all = readAll(dataDir)
+  return Boolean(all['*'] || all[sender])
+}
+
 /** Set the global override: every number's stickers carry these names. */
 export function setGlobalStickerDefaults(dataDir: string, pack: string, author: string): void {
   const all = readAll(dataDir)
