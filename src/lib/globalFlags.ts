@@ -29,3 +29,15 @@ export async function setWelcomeGloballyEnabled(enabled: boolean): Promise<void>
   flags.welcomeGlobal = enabled
   await fs.writeFile(FLAGS_FILE, JSON.stringify(flags, null, 2))
 }
+
+/** Default true — goodbyes flow unless the owner explicitly kills them. */
+export async function isGoodbyeGloballyEnabled(): Promise<boolean> {
+  const flags = await readFlags()
+  return flags.goodbyeGlobal !== false
+}
+
+export async function setGoodbyeGloballyEnabled(enabled: boolean): Promise<void> {
+  const flags = await readFlags()
+  flags.goodbyeGlobal = enabled
+  await fs.writeFile(FLAGS_FILE, JSON.stringify(flags, null, 2))
+}

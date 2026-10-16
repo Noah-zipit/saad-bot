@@ -6,7 +6,7 @@ import Database from './core/database.js'
 import { loadPlugins } from './core/pluginLoader.js'
 import { cleanTmp } from './core/utils.js'
 import { participantPn } from './lib/jidUtils.js'
-import { isWelcomeGloballyEnabled } from './lib/globalFlags.js'
+import { isWelcomeGloballyEnabled, isGoodbyeGloballyEnabled } from './lib/globalFlags.js'
 import { startPairingServer } from './web/pairingServer.js'
 import { startAiBridge } from './core/aiBridge.js'
 import './config.js'
@@ -170,6 +170,8 @@ async function init(): Promise<void> {
         // Owner-level global kill switch (shared across both instances):
         // when off, no welcome goes out anywhere, regardless of group setting.
         const welcomeGloballyEnabled = await isWelcomeGloballyEnabled()
+        // Same for goodbyes.
+        const goodbyeGloballyEnabled = await isGoodbyeGloballyEnabled()
 
         // Handle welcome/goodbye messages based on config
         if (update.action === 'add' && welcomeGloballyEnabled && group.settings.welcome) {
@@ -183,7 +185,7 @@ async function init(): Promise<void> {
             // Send welcome message
             await s.sendMessage(update.id, { text: welcomeMsg })
           }
-        } else if (update.action === 'remove' && group.settings.goodbye) {
+        } else if (update.action === 'remove' && goodbyeGloballyEnabled && group.settings.goodbye) {
           for (const participant of update.participants) {
             // Get left user name (prefer the PN form so LID-addressed members resolve)
             const userName = await getContactName(s, participantPn(participant) ?? participant.id)
