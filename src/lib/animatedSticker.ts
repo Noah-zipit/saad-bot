@@ -36,6 +36,13 @@
  *     line, ~7% more budget than the old 450KB, worth roughly one rung.
  *  4. Deeper rungs exist for pathological content, but trimming happens
  *     before resolution/fps collapse, so the common case never sees them.
+ *  5. ANIMATION-FLAG REPAIR (2026-10-17, "fix GIFs"): ffmpeg 8.x's webp
+ *     muxer silently drops the VP8X animation bit on narrow canvases
+ *     (observed: widths <= 399 lose it, width 400 keeps it). The mid-ladder
+ *     rungs (384px/320px) are exactly where busy GIFs land, so busy GIFs
+ *     arrived as static images even though all frames were encoded.
+ *     ensureAnimationFlag() re-sets the bit whenever an ANIM chunk is
+ *     present, on both the encoder output and the EXIF-stamped buffer.
  */
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
@@ -109,7 +116,50 @@ export async function addStickerMetadata(webp: Buffer, meta: StickerMetadata): P
   if (vp8x >= 0 && out.length > vp8x + 8 && webp.length > vp8x + 8) {
     out[vp8x + 8] = webp[vp8x + 8] | 0x04
   }
-  return out
+  // Belt and braces: makeAnimatedSticker already guarantees the animation
+  // bit, but if this buffer ever comes from another encoder, repair it here
+  // too — a sticker without the bit arrives static on the phone.
+  return ensureAnimationFlag(out)
+}
+
+/**
+ * Repair the VP8X animation bit (0x10) on an animated webp.
+ *
+ * ffmpeg 8.x quirk (2026-10-17, "fix GIFs"): the webp muxer silently drops
+ * the animation feature flag when the encoded canvas is narrow (observed:
+ * widths <= 399 lose the bit, width 400 keeps it — same frames, same
+ * container, only the canvas differs). The file still carries a full ANIM
+ * chunk and all ANMF frames, but WhatsApp reads the flag, not the frames,
+ * and displays the sticker as a static image. The mid-ladder rungs
+ * (384px/320px) are exactly the ones a busy GIF lands on, so busy GIFs
+ * were the ones that "stopped moving".
+ *
+ * This sets the bit whenever an ANIM chunk is present — spec-correct, since
+ * ANIM is what makes the file animated — and leaves genuinely static
+ * webps untouched.
+ */
+export function ensureAnimationFlag(webp: Buffer): Buffer {
+  const vp8x = webp.indexOf('VP8X')
+  if (vp8x < 0 || webp.length <= vp8x + 8) return webp
+  if (webp[vp8x + 8] & 0x10) return webp // already set
+  // Only repair when the container really is animated.
+  let off = 12
+  let animated = false
+  while (off + 8 <= webp.length) {
+    const fourcc = webp.subarray(off, off + 4).toString('latin1')
+    if (fourcc === 'ANIM') {
+      animated = true
+      break
+    }
+    if (!/^[\x20-\x7e]{4}$/.test(fourcc)) break
+    const size = webp.readUInt32LE(off + 4)
+    if (off + 8 + size > webp.length) break
+    off += 8 + size + (size & 1)
+  }
+  if (!animated) return webp
+  const fixed = Buffer.from(webp)
+  fixed[vp8x + 8] = fixed[vp8x + 8] | 0x10
+  return fixed
 }
 
 /**
@@ -372,12 +422,15 @@ export async function makeAnimatedSticker(input: Buffer, ext: string): Promise<B
       await execFileAsync('ffmpeg', args, { timeout: 120_000 })
       const buf = await readFile(out)
       if (!smallest || buf.length < smallest.length) smallest = buf
-      if (buf.length <= MAX_BYTES) return buf
+      // Repair the VP8X animation bit: ffmpeg's webp muxer drops it on
+      // narrow canvases (see ensureAnimationFlag) — without this, GIFs that
+      // land on the 384px/320px rungs arrive as static images.
+      if (buf.length <= MAX_BYTES) return ensureAnimationFlag(buf)
     }
     // Even the smallest attempt is oversized — return the smallest we got
     // rather than nothing; it still animates on most clients.
     if (!smallest) throw new Error('animated sticker encode produced no output')
-    return smallest
+    return ensureAnimationFlag(smallest)
   } finally {
     await rm(dir, { recursive: true, force: true }).catch(() => {})
   }
