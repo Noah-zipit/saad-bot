@@ -92,7 +92,9 @@ const handler = async (m: ParsedMessage, { sock, db }: CommandContext) => {
 export default {
   pattern: /^(s|sticker|stiker|seal)$/i,
   handler,
-  help: 'Convert image/video to sticker (animated stays animated)',
+  help: 'Convert image/video to sticker (animated stays animated). Shortcut: !s works exactly like !sticker — reply to media or send it with the caption !s.',
+  usage: '!s [pack name | author]  — reply to an image/video, or send media with caption !s',
+  example: '!s (reply to a GIF to make an animated sticker)',
   tags: ['media'],
   group: false,
   admin: false,

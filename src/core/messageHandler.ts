@@ -14,6 +14,7 @@ import {
   decodeJid,
   participantPn
 } from '../lib/jidUtils.js'
+import { unwrapViewOnceMessage, VIEW_ONCE_MEDIA_TYPES } from '../lib/viewOnce.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const tmpDir = path.join(__dirname, '../../tmp')
@@ -121,7 +122,7 @@ export async function handleMessage(message: WAMessage, sock: WASocket, db: Data
 
   // --- Anti view-once: save incoming view-once photos/videos/voice notes and
   // re-send them as normal messages so they stay viewable (owner asked for this).
-  if (m.viewOnce && ['imageMessage', 'videoMessage', 'audioMessage'].includes(m.viewOnce.type)) {
+  if (m.viewOnce && VIEW_ONCE_MEDIA_TYPES.includes(m.viewOnce.type)) {
     const avSetting = await db.getSetting('antiViewOnce')
     if (avSetting?.enabled !== false) {
       try {
@@ -144,6 +145,12 @@ export async function handleMessage(message: WAMessage, sock: WASocket, db: Data
             await sock.sendMessage(m.chat, { text: note })
           }
           console.log(`[anti-viewonce] saved ${kind} from ${digitsOf(m.sender)} in ${m.chat}`)
+        } else {
+          // Visible instead of silent: the user thought the feature was dead.
+          await sock.sendMessage(m.chat, {
+            text: '👁 _View-once detected, but I could not fetch the media (it may have expired). Reply to it with *!vv* and I will try again._'
+          })
+          console.log(`[anti-viewonce] download failed for view-once from ${digitsOf(m.sender)} in ${m.chat}`)
         }
       } catch (e) {
         console.error('[anti-viewonce] failed:', e)
@@ -222,13 +229,10 @@ async function parseMessage(message: WAMessage, sock: WASocket): Promise<ParsedM
   const type = types[0] ?? ''
   let body = ''
 
-  // Unwrap view-once messages so the inner media can be seen/downloaded
-  let viewOnce: { type: string; message: Record<string, any> } | undefined
-  if (['viewOnceMessage', 'viewOnceMessageV2', 'viewOnceMessageV2Extension'].includes(type)) {
-    const wrapped = ((inner as Record<string, any>)[type]?.message ?? {}) as Record<string, any>
-    const innerType = Object.keys(wrapped)[0] ?? ''
-    if (innerType) viewOnce = { type: innerType, message: { [innerType]: wrapped[innerType] } }
-  }
+  // Unwrap view-once messages so the inner media can be seen/downloaded.
+  // The helper also peels ephemeralMessage wrappers (disappearing-message
+  // chats), which used to make view-once detection silently miss everything.
+  const viewOnce = unwrapViewOnceMessage(inner as Record<string, any>)
 
   if (type === 'conversation') {
     body = inner.conversation || ''
@@ -262,10 +266,20 @@ async function parseMessage(message: WAMessage, sock: WASocket): Promise<ParsedM
       sender: decodeJid(inner.extendedTextMessage?.contextInfo?.participant) ?? '',
       type: quotedType
     }
-    // Allow downloading quoted media (e.g. !sticker as a reply to an image)
-    if (quotedType === 'imageMessage' || quotedType === 'videoMessage') {
+    // Allow downloading quoted media (e.g. !sticker as a reply to an image),
+    // including view-once media (e.g. !vv as a reply to a view-once message).
+    // NOTE: stickerMessage MUST be in this list — !take's main use case is
+    // replying to a sticker, and without it quoted.download stays undefined
+    // and the command fails with "Failed to download that media."
+    if (quotedType === 'imageMessage' || quotedType === 'videoMessage' || quotedType === 'stickerMessage') {
       const quotedWamsg = { key: message.key, message: quotedMessage } as WAMessage
       quoted.download = () => downloadToTmp(quotedWamsg, quotedType)
+    } else {
+      const quotedVo = unwrapViewOnceMessage(quotedMessage as Record<string, any>)
+      if (quotedVo) {
+        const quotedWamsg = { key: message.key, message: quotedVo.message } as WAMessage
+        quoted.download = () => downloadToTmp(quotedWamsg, quotedVo.type)
+      }
     }
   }
 
