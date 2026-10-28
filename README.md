@@ -4,7 +4,7 @@ A WhatsApp bot built on [Baileys](https://github.com/WhiskeySockets/Baileys) (`7
 
 ## Features
 
-- 39 commands across 6 categories: basic, admin, group, fun, media, owner
+- 57 commands across 6 categories: basic, admin, group, fun, media, owner
 - Command prefix `!` (configurable via `PREFIX`)
 - Local JSON storage in `./data/` (`users.json`, `groups.json`, `settings.json`, `lidmap.json`) — no MongoDB
 - LID → phone-number identity resolution:
@@ -98,7 +98,7 @@ src/
     jidUtils.ts          # LID/JID identity helpers (isLidJid, resolveToPn,
                          # senderPnFromKey, buildMentionTargets, displayUser…)
   commands/
-    admin/ basic/ fun/ group/ media/ owner/   # 39 command plugins
+    admin/ basic/ fun/ group/ media/ owner/   # 57 command plugins
 asset/
   logo.jpg               # Logo shown in !menu
 data/                    # Created at runtime (JSON storage)
