@@ -1,6 +1,4 @@
-import { Sticker } from 'wa-sticker-formatter'
-import { fileTypeFromBuffer } from 'file-type'
-import type { ParsedMessage, CommandContext, MediaDownloadResult } from '../../core/types.js'
+import type { ParsedMessage, CommandContext } from '../../core/types.js'
 import { getStickerDefaults, setStickerDefaults, clearStickerDefaults, getGlobalStickerDefaults, setGlobalStickerDefaults, clearGlobalStickerDefaults, parseNameArgs, rawArgsText } from '../../lib/stickerNames.js'
 
 /**
