@@ -53,6 +53,21 @@ const RARITY_ORDER = ['Legendary', 'Epic', 'Rare', 'Common'] as const
 
 const trunc = (s: string, n: number): string => (s.length > n ? s.slice(0, n - 1) + '…' : s)
 
+/**
+ * Race a promise against a timer. The underlying work is not cancelled,
+ * but the caller stops waiting — a hung media upload or relay must never
+ * swallow a whole trade (that is how !trade went silent on 2026-11-23:
+ * no reply, no error, the handler just never came back).
+ */
+function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  return Promise.race([
+    p,
+    new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error(`timed out after ${ms}ms: ${label}`)), ms)
+    )
+  ])
+}
+
 function ownedCards(p: Player): { def: CardDef; count: number }[] {
   return Object.entries(p.cards)
     .map(([id, count]) => ({ def: CARD_BY_ID[id], count }))
@@ -98,7 +113,12 @@ async function sendListMessage(
     userJid: sock.user?.id ?? '',
     quoted
   })
-  await sock.relayMessage(chat, waMsg.message!, { messageId: waMsg.key.id! })
+  await withTimeout(
+    sock.relayMessage(chat, waMsg.message!, { messageId: waMsg.key.id! }),
+    15000,
+    'list relay'
+  )
+  console.log('[trade] list relay ok')
 }
 
 /**
@@ -116,10 +136,12 @@ async function sendCatalogCard(
   index: number,
   total: number
 ): Promise<void> {
-  const media = await prepareWAMessageMedia(
-    { image: { url: card.img } },
-    { upload: sock.waUploadToServer }
+  const media = await withTimeout(
+    prepareWAMessageMedia({ image: { url: card.img } }, { upload: sock.waUploadToServer }),
+    20000,
+    'catalog media upload'
   )
+  console.log('[trade] catalog media ok', card.id)
   const pickLabel = step === 'give' ? 'Give this card' : 'Want this card'
   const pickWord = step === 'give' ? 'Give' : 'Want'
   const buttons = [
@@ -169,7 +191,12 @@ async function sendCatalogCard(
     userJid: sock.user?.id ?? '',
     quoted
   })
-  await sock.relayMessage(chat, waMsg.message!, { messageId: waMsg.key.id! })
+  await withTimeout(
+    sock.relayMessage(chat, waMsg.message!, { messageId: waMsg.key.id! }),
+    15000,
+    'catalog relay'
+  )
+  console.log('[trade] catalog relay ok', card.id)
 }
 
 async function sendText(sock: WASocket, chat: string, text: string): Promise<void> {
@@ -325,6 +352,7 @@ export async function startTradeFlow(
   partner: string,
   presetGiveId?: string
 ): Promise<void> {
+  console.log('[trade] start', digitsOf(m.sender), '->', digitsOf(partner), presetGiveId ?? '')
   if (sameUser(partner, m.sender)) {
     await m.reply('You cannot trade with yourself.')
     return
@@ -393,9 +421,11 @@ async function sendPickCascade(
   t.catalogList = owned.map(o => o.def.id)
   t.catalogIndex = 0
   try {
+    console.log('[trade] pick', step, 'try catalog', owned[0].def.id)
     await sendCatalogCard(sock, chat, quoted, owned[0].def, step, 0, owned.length)
     t.mode = 'catalog'
     t.menuOptions = []
+    console.log('[trade] pick', step, 'sent catalog')
     return
   } catch (e) {
     console.error('[trade] catalog send failed, falling back to list:', e)
@@ -403,6 +433,7 @@ async function sendPickCascade(
   const { mode, options } = await sendPick(sock, chat, quoted, headingFor(step, t), 'Choose card', owned, step)
   t.mode = mode
   t.menuOptions = options
+  console.log('[trade] pick', step, 'sent', mode)
 }
 
 async function sendGiveStep(sock: WASocket, m: ParsedMessage, t: PendingTrade): Promise<void> {
