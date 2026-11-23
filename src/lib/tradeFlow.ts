@@ -1,5 +1,5 @@
 import type { WASocket, WAMessage } from '@whiskeysockets/baileys'
-import { proto, generateWAMessageFromContent } from '@whiskeysockets/baileys'
+import { proto, generateWAMessageFromContent, prepareWAMessageMedia } from '@whiskeysockets/baileys'
 import type { ParsedMessage } from '../core/types.js'
 import { CARDS, CARD_BY_ID, formatCard, type CardDef } from './cards.js'
 import { getPlayer, ownsCard, tradeCards, type Player } from './cardStore.js'
@@ -35,9 +35,13 @@ export interface PendingTrade {
   giveCardId?: string
   wantCardId?: string
   stage: TradeStage
-  mode: 'list' | 'menu'
+  mode: 'catalog' | 'list' | 'menu'
   /** card ids in menu order (menu mode only) */
   menuOptions: string[]
+  /** card ids in catalog order (catalog mode only) */
+  catalogList: string[]
+  /** index into catalogList of the card currently shown */
+  catalogIndex: number
   /** where the confirm goes: the group, or the partner's DM */
   confirmChat: string
   createdAt: number
@@ -90,6 +94,77 @@ async function sendListMessage(
   list: proto.Message.IListMessage
 ): Promise<void> {
   const content = proto.Message.fromObject({ listMessage: list })
+  const waMsg = generateWAMessageFromContent(chat, content, {
+    userJid: sock.user?.id ?? '',
+    quoted
+  })
+  await sock.relayMessage(chat, waMsg.message!, { messageId: waMsg.key.id! })
+}
+
+/**
+ * Send one card as an image with Give/Want, Next and Cancel buttons —
+ * the slide-through catalog. The art is uploaded to WhatsApp first;
+ * a .gif card may come back as a video message, which the header
+ * handles too. Throws on failure; the caller falls back to the list.
+ */
+async function sendCatalogCard(
+  sock: WASocket,
+  chat: string,
+  quoted: WAMessage | undefined,
+  card: CardDef,
+  step: 'give' | 'want',
+  index: number,
+  total: number
+): Promise<void> {
+  const media = await prepareWAMessageMedia(
+    { image: { url: card.img } },
+    { upload: sock.waUploadToServer }
+  )
+  const pickLabel = step === 'give' ? 'Give this card' : 'Want this card'
+  const pickWord = step === 'give' ? 'Give' : 'Want'
+  const buttons = [
+    {
+      buttonId: `trade:${step}:${card.id}`,
+      buttonText: { displayText: pickLabel },
+      type: proto.Message.ButtonsMessage.Button.Type.RESPONSE
+    },
+    {
+      buttonId: `trade:next:${step}`,
+      buttonText: { displayText: 'Next ➡️' },
+      type: proto.Message.ButtonsMessage.Button.Type.RESPONSE
+    },
+    {
+      buttonId: 'trade:cancel',
+      buttonText: { displayText: 'Cancel' },
+      type: proto.Message.ButtonsMessage.Button.Type.RESPONSE
+    }
+  ]
+  const base = {
+    contentText:
+      `*${card.name}*\n${card.series}\n${card.rarity} · ⚔️ ${card.power}\n\n` +
+      `Card ${index + 1} of ${total} — tap ${pickWord} to pick it, Next to keep looking.`,
+    footerText: 'Saad Bot • Card trade',
+    buttons
+  }
+  const content = media.imageMessage
+    ? proto.Message.fromObject({
+        buttonsMessage: {
+          ...base,
+          headerType: proto.Message.ButtonsMessage.HeaderType.IMAGE,
+          imageMessage: media.imageMessage
+        }
+      })
+    : media.videoMessage
+      ? proto.Message.fromObject({
+          buttonsMessage: {
+            ...base,
+            headerType: proto.Message.ButtonsMessage.HeaderType.VIDEO,
+            videoMessage: media.videoMessage
+          }
+        })
+      : (() => {
+          throw new Error('card art did not upload as image or video')
+        })()
   const waMsg = generateWAMessageFromContent(chat, content, {
     userJid: sock.user?.id ?? '',
     quoted
@@ -281,8 +356,10 @@ export async function startTradeFlow(
     partner,
     giveCardId: presetGiveId,
     stage: presetGiveId ? 'pick-want' : 'pick-give',
-    mode: 'list',
+    mode: 'catalog',
     menuOptions: [],
+    catalogList: [],
+    catalogIndex: 0,
     confirmChat: m.isGroup ? m.chat : partner,
     createdAt: Date.now()
   }
@@ -291,18 +368,52 @@ export async function startTradeFlow(
   if (presetGiveId) {
     await sendWantStep(sock, m, trade)
   } else {
-    const { mode, options } = await sendPick(
-      sock,
-      m.chat,
-      m.message,
-      `*🔄 TRADE*\n\nTap the card you give to ${digitsOf(partner)}:`,
-      'Choose card',
-      ownedCards(me),
-      'give'
-    )
-    trade.mode = mode
-    trade.menuOptions = options
+    await sendGiveStep(sock, m, trade)
   }
+}
+
+function headingFor(step: 'give' | 'want', t: PendingTrade): string {
+  return step === 'give'
+    ? `*🔄 TRADE*\n\nTap the card you give to ${digitsOf(t.partner)}:`
+    : `Now tap the card you want from ${digitsOf(t.partner)}:`
+}
+
+/**
+ * Pick cascade: image catalog first, then the text list, then the
+ * numbered menu. Sets the trade's mode and menu/catalog order.
+ */
+async function sendPickCascade(
+  sock: WASocket,
+  chat: string,
+  quoted: WAMessage | undefined,
+  owned: { def: CardDef; count: number }[],
+  step: 'give' | 'want',
+  t: PendingTrade
+): Promise<void> {
+  t.catalogList = owned.map(o => o.def.id)
+  t.catalogIndex = 0
+  try {
+    await sendCatalogCard(sock, chat, quoted, owned[0].def, step, 0, owned.length)
+    t.mode = 'catalog'
+    t.menuOptions = []
+    return
+  } catch (e) {
+    console.error('[trade] catalog send failed, falling back to list:', e)
+  }
+  const { mode, options } = await sendPick(sock, chat, quoted, headingFor(step, t), 'Choose card', owned, step)
+  t.mode = mode
+  t.menuOptions = options
+}
+
+async function sendGiveStep(sock: WASocket, m: ParsedMessage, t: PendingTrade): Promise<void> {
+  const me = getPlayer(t.initiator)
+  const owned = ownedCards(me)
+  if (owned.length === 0) {
+    PENDING.delete(t.initiator)
+    await m.reply('You have no cards yet. Open a *!pack* first.')
+    return
+  }
+  await sendPickCascade(sock, t.initiatorChat, m.message, owned, 'give', t)
 }
 
 async function sendWantStep(sock: WASocket, m: ParsedMessage, t: PendingTrade): Promise<void> {
@@ -313,22 +424,13 @@ async function sendWantStep(sock: WASocket, m: ParsedMessage, t: PendingTrade): 
     await m.reply('They have no cards left to trade. Trade cancelled.')
     return
   }
-  const { mode, options } = await sendPick(
-    sock,
-    t.initiatorChat,
-    m.message,
-    `Now tap the card you want from ${digitsOf(t.partner)}:`,
-    'Choose card',
-    owned,
-    'want'
-  )
-  t.mode = mode
-  t.menuOptions = options
+  await sendPickCascade(sock, t.initiatorChat, m.message, owned, 'want', t)
 }
 
 type TradeAction =
   | { kind: 'give'; cardId: string }
   | { kind: 'want'; cardId: string }
+  | { kind: 'next'; step: 'give' | 'want' }
   | { kind: 'accept' }
   | { kind: 'decline' }
   | { kind: 'cancel' }
@@ -355,6 +457,44 @@ async function advance(
       )
     } else {
       await notifyBoth(sock, t, 'They cancelled the trade.', 'Trade cancelled.')
+    }
+    return
+  }
+
+  if (action.kind === 'next') {
+    if (
+      !isInitiator ||
+      (action.step === 'give' && t.stage !== 'pick-give') ||
+      (action.step === 'want' && t.stage !== 'pick-want')
+    ) {
+      await m.reply('That tap is not for you, or this trade has moved on.')
+      return
+    }
+    if (t.catalogList.length === 0) {
+      await m.reply('Nothing to slide through here.')
+      return
+    }
+    t.catalogIndex = (t.catalogIndex + 1) % t.catalogList.length
+    const card = CARD_BY_ID[t.catalogList[t.catalogIndex]]
+    if (!card) return
+    try {
+      await sendCatalogCard(sock, t.initiatorChat, m.message, card, action.step, t.catalogIndex, t.catalogList.length)
+      t.mode = 'catalog'
+    } catch (e) {
+      console.error('[trade] catalog next failed, falling back to list:', e)
+      const owned =
+        action.step === 'give' ? ownedCards(getPlayer(t.initiator)) : ownedCards(getPlayer(t.partner))
+      const { mode, options } = await sendPick(
+        sock,
+        t.initiatorChat,
+        m.message,
+        headingFor(action.step, t),
+        'Choose card',
+        owned,
+        action.step
+      )
+      t.mode = mode
+      t.menuOptions = options
     }
     return
   }
@@ -450,6 +590,8 @@ export async function handleTradeInteraction(m: ParsedMessage, sock: WASocket): 
     await advance(sock, m, t, { kind: 'give', cardId: parts[2] })
   } else if (step === 'want' && parts[2]) {
     await advance(sock, m, t, { kind: 'want', cardId: parts[2] })
+  } else if (step === 'next' && (parts[2] === 'give' || parts[2] === 'want')) {
+    await advance(sock, m, t, { kind: 'next', step: parts[2] })
   } else if (step === 'accept') {
     await advance(sock, m, t, { kind: 'accept' })
   } else if (step === 'decline') {
