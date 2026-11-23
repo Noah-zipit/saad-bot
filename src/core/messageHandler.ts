@@ -11,6 +11,8 @@ import {
   resolveToPn,
   digitsOf,
   isLidJid,
+  isPnJid,
+  normalizePn,
   decodeJid,
   participantPn
 } from '../lib/jidUtils.js'
@@ -79,28 +81,56 @@ export async function handleMessage(message: WAMessage, sock: WASocket, db: Data
   if (m.key.remoteJid === 'status@broadcast') return
 
   // --- LID/PN identity canonicalization ---
-  // Own messages keep the bot's own JID (as the JS version did); everything
-  // else canonicalizes key.participant || key.remoteJid to the PN form when
-  // WhatsApp's key alternates or the LID mapping store can resolve it.
-  const rawSender = message.key.fromMe && sock.user?.id
+  // Own-account messages (the bot's own sends, and messages the owner
+  // sends from their phone) are always the bot account's owner. They must
+  // never resolve through the key alternates: in a fromMe DM, remoteJidAlt
+  // names the CHAT (the other party), not the sender — reading it used to
+  // attribute the owner's messages to whoever they were talking to, so the
+  // owner and that person shared one identity (one pack cooldown, one
+  // collection). Everyone else canonicalizes key.participant ||
+  // key.remoteJid to the PN form when WhatsApp's key alternates or the LID
+  // mapping store can resolve it.
+  const fromMe = !!message.key.fromMe
+  const rawSender = fromMe && sock.user?.id
     ? decodeJid(sock.user.id) ?? ''
     : rawSenderJid(message)
-  const keyPn = senderPnFromKey(message)
-  const mappedPn = keyPn ?? (await resolveToPn(sock, rawSender)) ?? db.lookupPnByLid(rawSender)
 
   let sender: string
-  if (mappedPn) {
-    // Remember the link so future messages resolve instantly and the user's
-    // stored record (bans, warnings, premium) follows them across address forms.
-    if (isLidJid(rawSender)) await db.linkLidPn(rawSender, mappedPn)
-    sender = mappedPn
+  let mappedPn: string | undefined
+  if (fromMe) {
+    sender = isPnJid(rawSender) ? normalizePn(rawSender) : rawSender
+    mappedPn = isPnJid(sender) ? sender : undefined
   } else {
-    sender = rawSender
+    const keyPn = senderPnFromKey(message)
+    mappedPn = keyPn ?? (await resolveToPn(sock, rawSender)) ?? db.lookupPnByLid(rawSender)
+    if (mappedPn) {
+      // Remember the link so future messages resolve instantly and the user's
+      // stored record (bans, warnings, premium) follows them across address forms.
+      if (isLidJid(rawSender)) await db.linkLidPn(rawSender, mappedPn)
+      sender = mappedPn
+    } else {
+      sender = rawSender
+    }
   }
 
   m.senderRaw = rawSender
   m.senderPn = mappedPn
   m.sender = sender
+
+  // Mentions and quoted senders arrive in raw form (often a LID) and must
+  // go through the same resolution, or !duel / !trade see a stranger with
+  // no cards where a known player stands.
+  const canonicalJid = async (jid: string): Promise<string> => {
+    if (isPnJid(jid)) return normalizePn(jid)
+    if (isLidJid(jid)) return (await resolveToPn(sock, jid)) ?? db.lookupPnByLid(jid) ?? jid
+    return jid
+  }
+  if (m.mentionedJid.length > 0) {
+    m.mentionedJid = await Promise.all(m.mentionedJid.map(canonicalJid))
+  }
+  if (m.quoted) {
+    m.quoted.sender = await canonicalJid(m.quoted.sender)
+  }
   // Messages sent from the bot's own linked device are the owner's own hands.
   m.isOwner = isOwner(m.sender) || !!message.key.fromMe
 

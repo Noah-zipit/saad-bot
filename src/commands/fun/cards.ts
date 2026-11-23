@@ -1,5 +1,5 @@
 import type { ParsedMessage, CommandContext } from '../../core/types.js'
-import { digitsOf } from '../../lib/jidUtils.js'
+import { digitsOf, sameUser } from '../../lib/jidUtils.js'
 import {
   findCard,
   formatCard,
@@ -163,7 +163,7 @@ const handler = async (m: ParsedMessage, { args, sock }: CommandContext) => {
       if (!partner) {
         return m.reply('Tag someone or reply to their message to duel them.\n\nExample: *!duel @user*')
       }
-      if (partner === m.sender) return m.reply('You cannot duel yourself.')
+      if (sameUser(partner, m.sender)) return m.reply('You cannot duel yourself.')
       const me = getPlayer(m.sender)
       const them = getPlayer(partner)
       const myCard = strongestCard(me)
