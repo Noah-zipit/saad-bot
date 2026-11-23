@@ -9,6 +9,7 @@ import { participantPn } from './lib/jidUtils.js'
 import { isWelcomeGloballyEnabled, isGoodbyeGloballyEnabled } from './lib/globalFlags.js'
 import { startPairingServer } from './web/pairingServer.js'
 import { startAiBridge } from './core/aiBridge.js'
+import { startReminderTicker } from './lib/reminderStore.js'
 import './config.js'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -239,6 +240,9 @@ async function init(): Promise<void> {
 
   // AI bridge: deliver assistant answers for !ai queries back to WhatsApp
   startAiBridge(() => sockHolder.current)
+
+  // Reminder ticker: delivers due !remind messages (approved 2026-10-25)
+  startReminderTicker(() => sockHolder.current, db.dataDir)
 
   // Clean temporary files every hour
   setInterval(cleanTmp, 3600000)

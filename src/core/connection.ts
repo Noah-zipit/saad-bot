@@ -39,6 +39,21 @@ type LooseSocket = WASocket & {
 /** Always points at the live socket (updated whenever a reconnect replaces it). */
 export const sockHolder: { current: WASocket | null } = { current: null }
 
+// Reconnect-log throttle state (see the connection.update handler below).
+let lastDropAt = 0
+let suppressedDrops = 0
+
+/** One short human-readable cause for a disconnect, e.g. "428 connection-replaced". */
+function describeDisconnect(err: unknown): string {
+  const e = err as { output?: { statusCode?: number }; statusCode?: number; message?: string } | undefined
+  const code = e?.output?.statusCode ?? e?.statusCode
+  if (typeof code === 'number') {
+    const name = (DisconnectReason as unknown as Record<number, string>)[code] ?? 'unknown'
+    return `${code} ${name}`
+  }
+  return e?.message ? String(e.message).slice(0, 120) : 'unknown reason'
+}
+
 let replacedCallback: ((sock: WASocket) => void) | null = null
 
 /** Register a callback fired with the new socket every time a reconnect replaces it. */
@@ -130,13 +145,27 @@ export async function connectToWhatsApp(): Promise<WASocket> {
   sockHolder.current = sock
 
   // Set up connection event handling
+  // RECONNECT-LOG FIX (staged): a WhatsApp drop used to dump the whole
+  // Disconnect error object (multi-KB, different every time, so the
+  // dedup in index.ts never caught it) on every drop, so a reconnect
+  // burst filled the log. Now each drop logs ONE short line, and drops
+  // repeating inside 60s are counted and summarised once instead.
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect } = update
 
     if (connection === 'close') {
       const shouldReconnect = (lastDisconnect?.error as any)?.output?.statusCode !== DisconnectReason.loggedOut
-
-      console.log('Connection closed due to:', lastDisconnect?.error, 'Reconnecting:', shouldReconnect)
+      const now = Date.now()
+      if (now - lastDropAt < 60_000) {
+        suppressedDrops++
+      } else {
+        if (suppressedDrops > 0) {
+          console.log(`[conn] ${suppressedDrops} more disconnect(s) in the last minute (same cause, not shown)`)
+          suppressedDrops = 0
+        }
+        console.log(`[conn] disconnected (${describeDisconnect(lastDisconnect?.error)}), reconnecting: ${shouldReconnect ? 'yes' : 'no — logged out'}`)
+      }
+      lastDropAt = now
 
       if (shouldReconnect) {
         connectToWhatsApp()
@@ -144,6 +173,10 @@ export async function connectToWhatsApp(): Promise<WASocket> {
           .catch((err) => console.error('Reconnect failed:', err))
       }
     } else if (connection === 'open') {
+      if (suppressedDrops > 0) {
+        console.log(`[conn] back online — ${suppressedDrops} disconnect(s) suppressed during the burst`)
+        suppressedDrops = 0
+      }
       console.log('Connected to WhatsApp')
     }
   })

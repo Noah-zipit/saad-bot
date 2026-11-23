@@ -1,7 +1,8 @@
 import { Sticker } from 'wa-sticker-formatter'
 import type { ParsedMessage, CommandContext } from '../../core/types.js'
 import { getStickerDefaults, hasCustomStickerNames } from '../../lib/stickerNames.js'
-import { makeAnimatedSticker, addStickerMetadata } from '../../lib/animatedSticker.js'
+import { makeAnimatedSticker, addStickerMetadata, validateAnimatedSticker } from '../../lib/animatedSticker.js'
+import { getProgress, saveProgress, clearProgress } from '../../lib/tgstickerProgress.js'
 
 const MAX_STICKERS = 10
 const TELEGRAM_FILE_URL = 'https://api.telegram.org/file/bot'
@@ -31,8 +32,12 @@ async function tgFetch(url: string, label: string): Promise<Response> {
 }
 
 /**
- * Download a Telegram sticker pack as WhatsApp stickers.
- * Usage: !tgsticker <telegram sticker pack link>
+ * Download a Telegram sticker pack as WhatsApp stickers, 10 per batch.
+ * Usage:
+ *   !tgsticker <link>         — first batch, or continue where you left off
+ *   !tgsticker <link> next    — next 10 after the last batch
+ *   !tgsticker <link> 2       — jump straight to batch 2 (sticks 11–20)
+ *   !tgsticker <link> reset   — start over from the first sticker
  * Requires TELEGRAM_BOT_TOKEN in the environment (any bot from @BotFather works).
  */
 const handler = async (m: ParsedMessage, { sock, args, db }: CommandContext) => {
@@ -51,9 +56,11 @@ const handler = async (m: ParsedMessage, { sock, args, db }: CommandContext) => 
   const input = (args[0] || '').trim()
   if (!input) {
     return m.reply(
-      `*Usage:* !tgsticker <telegram sticker pack link>\n\n` +
+      `*Usage:* !tgsticker <telegram sticker pack link> [next | page number | reset]\n\n` +
       `Example: !tgsticker https://t.me/addstickers/MyFavoritePack\n` +
-      `You can also pass just the pack name: !tgsticker MyFavoritePack`
+      `You can also pass just the pack name: !tgsticker MyFavoritePack\n\n` +
+      `Packs come in batches of ${MAX_STICKERS}. Run the command again (same link)\n` +
+      `for the next batch, or use !tgsticker <link> 2 for a specific batch.`
     )
   }
 
@@ -61,6 +68,23 @@ const handler = async (m: ParsedMessage, { sock, args, db }: CommandContext) => 
   let packName = input
   const linkMatch = input.match(/(?:t\.me\/addstickers\/|t\.me\/)([A-Za-z0-9_]+)/i)
   if (linkMatch) packName = linkMatch[1]
+
+  const dataDir = (db as unknown as { dataDir?: string }).dataDir || process.env.DATA_DIR || 'data'
+
+  // --- Pagination: default = continue where this user left off on this pack.
+  // Re-running with the same link no longer re-sends the first 10.
+  const pageArg = (args[1] || '').trim().toLowerCase()
+  let startOffset = 0
+  if (pageArg === 'reset') {
+    clearProgress(dataDir, m.sender, packName)
+    startOffset = 0
+  } else if (/^\d+$/.test(pageArg)) {
+    startOffset = (Math.max(1, parseInt(pageArg, 10)) - 1) * MAX_STICKERS
+  } else {
+    // "next" or no page arg: pick up from the saved position, if any.
+    const saved = getProgress(dataDir, m.sender, packName)
+    if (saved) startOffset = saved.offset
+  }
 
   try {
     await m.reply(global.mess.wait)
@@ -79,8 +103,17 @@ const handler = async (m: ParsedMessage, { sock, args, db }: CommandContext) => 
       return m.reply('That sticker pack appears to be empty.')
     }
 
+    // Pack changed size (or the whole pass finished): clamp to what's left.
+    if (startOffset >= stickers.length) {
+      clearProgress(dataDir, m.sender, packName)
+      return m.reply(
+        `You already got the whole pack — all ${stickers.length} stickers were sent earlier. ` +
+        `Run the command again to start over from the first one.`
+      )
+    }
+
     // 2. Resolve file paths (Telegram downloads require the bot token)
-    const targets = stickers.slice(0, MAX_STICKERS)
+    const targets = stickers.slice(startOffset, startOffset + MAX_STICKERS)
     const resolved: { fileId: string; url: string; animated: boolean; ext: string }[] = []
     for (const st of targets) {
       const fileId = st.file_id as string
@@ -98,12 +131,14 @@ const handler = async (m: ParsedMessage, { sock, args, db }: CommandContext) => 
       return m.reply('Failed to download any stickers from that pack. Try again later.')
     }
 
-    await m.reply(`*Pack:* ${title}\nSending ${resolved.length} sticker${resolved.length > 1 ? 's' : ''} — tap any sticker and star it to add it to your WhatsApp collection ⭐`)
+    const batchStart = startOffset + 1
+    const batchEnd = startOffset + resolved.length
+    const batchNo = Math.floor(startOffset / MAX_STICKERS) + 1
+    await m.reply(`*Pack:* ${title}\nBatch ${batchNo} — stickers ${batchStart}–${batchEnd} of ${stickers.length}.\nTap any sticker and star it to add it to your WhatsApp collection ⭐`)
 
     // Sticker branding: honor his saved !setname names (per-sender, or the
     // global `!setname all` override). If he never saved names, keep the
     // Telegram pack title + a neutral author line.
-    const dataDir = (db as unknown as { dataDir?: string }).dataDir || process.env.DATA_DIR || 'data'
     let packNameLabel: string
     let authorLabel: string
     if (hasCustomStickerNames(dataDir, m.sender)) {
@@ -117,6 +152,7 @@ const handler = async (m: ParsedMessage, { sock, args, db }: CommandContext) => 
 
     // 3. Download + convert each sticker and send it
     let sent = 0
+    let failed = 0
     for (const file of resolved) {
       try {
         const dl = await tgFetch(file.url, 'sticker file download')
@@ -136,6 +172,16 @@ const handler = async (m: ParsedMessage, { sock, args, db }: CommandContext) => 
             author: authorLabel,
             emojis: ['🌸']
           })
+          // 2026-11-03 Telegram flicker fix: never send a sticker the
+          // phone cannot display cleanly — a failed encode used to go
+          // out anyway and show up blinking/static. Skip it and count
+          // it, so the Done message says so instead of silently short.
+          const check = validateAnimatedSticker(stickerBuffer)
+          if (!check.ok || stickerBuffer.length > 512 * 1024) {
+            console.error(`tgsticker: skipping unplayable animated sticker (${check.reason || 'oversize'})`)
+            failed++
+            continue
+          }
         } else {
           const sticker = new Sticker(buffer, {
             pack: packNameLabel,
@@ -157,14 +203,28 @@ const handler = async (m: ParsedMessage, { sock, args, db }: CommandContext) => 
       }
     }
 
-    const totalNote = stickers.length > MAX_STICKERS
-      ? `\n\n_Note: the pack has ${stickers.length} stickers; I sent the first ${MAX_STICKERS}. Run the command again with the pack name to get the next batch? Not yet — that paging isn't built. Send the link to a smaller pack instead._`
+    // 4. Save progress so the next run continues with the NEXT batch —
+    // the old bug (always re-sending 0–9) is what this removes.
+    const nextOffset = startOffset + MAX_STICKERS
+    const moreLeft = nextOffset < stickers.length
+    if (moreLeft) {
+      saveProgress(dataDir, m.sender, packName, nextOffset, stickers.length)
+    } else {
+      clearProgress(dataDir, m.sender, packName)
+    }
+
+    const totalNote = moreLeft
+      ? `\n\n_${stickers.length - nextOffset} left in the pack. Run the same command again (or !tgsticker <link> next) for the next ${MAX_STICKERS} — no more repeats._`
+      : `\n\n_That was the whole pack — all ${stickers.length} stickers delivered._`
+
+    const failedNote = failed > 0
+      ? `\n\n_${failed} sticker${failed === 1 ? '' : 's'} in this batch would not play cleanly, so I skipped ${failed === 1 ? 'it' : 'them'} instead of sending a blinking one. Re-run the same batch with reset if you want to retry ${failed === 1 ? 'it' : 'them'}._`
       : ''
 
     await m.reply(
-      `*Done.* Sent ${sent} sticker${sent === 1 ? '' : 's'} from *${title}*.\n` +
+      `*Done.* Sent ${sent} sticker${sent === 1 ? '' : 's'} from *${title}* (stickers ${batchStart}–${batchEnd}).\n` +
       `They carry your pack name — *${packNameLabel}* by *${authorLabel}*.\n\n` +
-      `To add them to your WhatsApp sticker collection, tap a sticker → Add to favorites ⭐.${totalNote}`
+      `To add them to your WhatsApp sticker collection, tap a sticker → Add to favorites ⭐.${totalNote}${failedNote}`
     )
   } catch (error) {
     console.error('Error in tgsticker command:', error)
@@ -178,9 +238,9 @@ const handler = async (m: ParsedMessage, { sock, args, db }: CommandContext) => 
 export default {
   pattern: /^(tgsticker|telegramsticker|tgs|stickpack|packsticker)$/i,
   handler,
-  help: 'Download Telegram sticker pack as WhatsApp stickers',
-  usage: '!tgsticker <telegram sticker link>',
-  example: '!tgsticker https://t.me/addstickers/MyFavoritePack',
+  help: 'Download Telegram sticker pack as WhatsApp stickers (10 per batch)',
+  usage: '!tgsticker <telegram sticker link> [next | page | reset]',
+  example: '!tgsticker https://t.me/addstickers/MyFavoritePack next',
   tags: ['media'],
   group: false,
   admin: false,

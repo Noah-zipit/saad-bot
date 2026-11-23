@@ -43,6 +43,42 @@
  *     arrived as static images even though all frames were encoded.
  *     ensureAnimationFlag() re-sets the bit whenever an ANIM chunk is
  *     present, on both the encoder output and the EXIF-stamped buffer.
+ *  6. SQUARE-CANVAS RULE (2026-10-24, "!s/!gif glitch"): WhatsApp animated
+ *     stickers must be exactly 512x512. The old filter only scaled the
+ *     long side to the rung width, so a portrait GIF came out 342x512
+ *     (and a landscape one 512x342). On the phone that non-square canvas
+ *     displayed split, with part of the frame duplicated and black bars
+ *     where the canvas should have been — the exact glitch in the
+ *     2026-10-24 screenshots. The 18:31 fix padded the scaled frame to a
+ *     full 512x512 transparent canvas, centred. That is spec-correct but
+ *     it still LOOKS like black bars on a dark chat background, because
+ *     transparent padding renders black there — which is what the user
+ *     reported again at 18:38 on a GIF.
+ *  7. FILL RULE (2026-10-24, "do what's better", other bots checked):
+ *     Flash-Md V2 and wa-sticker-formatter both offer a crop mode beside
+ *     the pad ("full") mode, and the smooth bar-free stickers are the
+ *     crop ones. So the GIF path now fills the square instead of
+ *     padding it: (a) trim black borders baked into the source with
+ *     cropdetect (a GIF that is already a small picture inside a black
+ *     frame stays small otherwise — no pad or crop on the outer canvas
+ *     can fix that), then (b) scale the SHORT side to 512 and centre
+ *     crop to 512x512. Edges are lost, exactly as in every other bot's
+ *     crop mode, but there are no bars at all. Never stretch to fill.
+ *     Size is shed by quality, duration and fps only — never by
+ *     shrinking the square, or the bars come back on the deep rungs.
+ *  8. FLICKER RULE (2026-11-03, "gif stickers for telegram are blinking
+ *     and ruining quality"): two encoder choices caused the blink on
+ *     Telegram video stickers (webm, typically 30fps, often with
+ *     transparency). (a) Conditional replenishment (-cr_threshold 4)
+ *     leaves near-static blocks un-updated, so noisy / gradient areas
+ *     hold a stale block and then jump — that reads as blinking.
+ *     It is now OFF (the libwebp default 0); the ladder absorbs the
+ *     extra bytes via quality/duration/fps instead. (b) -vsync 0
+ *     (passthrough) kept the source's uneven frame timestamps, so
+ *     frames did not play at even intervals. It is now -vsync cfr,
+ *     so every output frame is evenly spaced at the rung's fps.
+ *     Together: full re-encode of every frame, evenly timed, no
+ *     stale blocks left to flash.
  */
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
@@ -191,6 +227,14 @@ export function validateAnimatedSticker(buf: Buffer): StickerValidation {
     if (fourcc === 'VP8X') {
       if (size < 10) return { ok: false, reason: 'bad VP8X chunk' }
       if (!(buf[off + 8] & 0x10)) return { ok: false, reason: 'animation flag missing' }
+      // Square-canvas rule (2026-10-24): a non-512x512 animated sticker
+      // is the glitch — it must never be sent as a sticker. VP8X stores
+      // width-1 / height-1 in 3 bytes after the flag + 3 reserved bytes.
+      const canvasW = buf.readUIntLE(off + 8 + 4, 3) + 1
+      const canvasH = buf.readUIntLE(off + 8 + 7, 3) + 1
+      if (canvasW !== 512 || canvasH !== 512) {
+        return { ok: false, reason: `canvas not 512x512 (${canvasW}x${canvasH})` }
+      }
     } else if (fourcc === 'ANIM') {
       hasAnim = true
     } else if (fourcc === 'ANMF') {
@@ -208,6 +252,8 @@ interface SourceProbe {
   fps: number | null
   duration: number | null
   format: string | null
+  width: number | null
+  height: number | null
 }
 
 /**
@@ -250,12 +296,12 @@ export async function sourceToGifVideo(input: Buffer, ext: string): Promise<Buff
  * Any field may come back null when it can't be determined.
  */
 async function probeSource(input: string): Promise<SourceProbe> {
-  const probe: SourceProbe = { fps: null, duration: null, format: null }
+  const probe: SourceProbe = { fps: null, duration: null, format: null, width: null, height: null }
   try {
     const { stdout } = await execFileAsync(
       'ffprobe',
       ['-v', 'error', '-select_streams', 'v:0',
-       '-show_entries', 'stream=avg_frame_rate:format=duration,format_name',
+       '-show_entries', 'stream=avg_frame_rate,width,height:format=duration,format_name',
        '-of', 'default=nw=1', input],
       { timeout: 30_000 }
     )
@@ -269,12 +315,50 @@ async function probeSource(input: string): Promise<SourceProbe> {
         if (Number.isFinite(s) && s > 0) probe.duration = s
       } else if (k === 'format_name' && v) {
         probe.format = v.trim().toLowerCase()
+      } else if ((k === 'width' || k === 'height') && v) {
+        const n = Number(v)
+        if (Number.isFinite(n) && n > 0) probe[k] = n
       }
     }
   } catch {
     // probe failed — fall through with nulls and safe defaults below
   }
   return probe
+}
+
+/**
+ * Detect black borders baked into the source itself (rule 7a). Runs
+ * ffmpeg cropdetect over the first 30 frames with reset=0, so the
+ * reported crop is the content area common to all sampled frames —
+ * static bars stay, moving content inside them does not shrink it.
+ * Returns "w:h:x:y" or null. Rejected when the crop is implausibly
+ * small (a fade-to-black frame must not eat the picture), when it
+ * barely differs from the source, or when the source size is unknown.
+ */
+async function detectBlackCrop(input: string, probe: SourceProbe): Promise<string | null> {
+  if (probe.width === null || probe.height === null) return null
+  try {
+    const { stderr } = await execFileAsync(
+      'ffmpeg',
+      ['-v', 'info', '-y', '-i', input,
+       '-vf', 'cropdetect=limit=24:round=2:reset=0',
+       '-frames:v', '30', '-f', 'null', '-'],
+      { timeout: 60_000 }
+    )
+    const matches = [...stderr.matchAll(/crop=(\d+):(\d+):(\d+):(\d+)/g)]
+    if (matches.length === 0) return null
+    const last = matches[matches.length - 1]
+    const [w, h, x, y] = last.slice(1).map(Number)
+    if (w < 100 || h < 100) return null
+    if (w > probe.width || h > probe.height) return null
+    if (w * h < probe.width * probe.height * 0.1) return null
+    if (probe.width - w < 20 && probe.height - h < 20) return null
+    const aspect = w / h
+    if (aspect < 0.2 || aspect > 5) return null
+    return `${w}:${h}:${x}:${y}`
+  } catch {
+    return null
+  }
 }
 
 const VIDEO_FORMAT_TOKENS = new Set([
@@ -315,10 +399,12 @@ const LADDER: Attempt[] = [
   { fps: 15, quality: 80, maxWidth: 512 },
   { fps: 15, quality: 80, maxWidth: 512, maxSeconds: 2 },
   { fps: 15, quality: 78, maxWidth: 512, maxSeconds: 2 },
-  { fps: 12, quality: 78, maxWidth: 512, maxSeconds: 2 },
-  { fps: 12, quality: 75, maxWidth: 448, maxSeconds: 2 },
-  { fps: 12, quality: 72, maxWidth: 384, maxSeconds: 2 },
-  { fps: 12, quality: 68, maxWidth: 320, maxSeconds: 2 },
+  { fps: 15, quality: 75, maxWidth: 512, maxSeconds: 2 },
+  { fps: 12, quality: 75, maxWidth: 512, maxSeconds: 2 },
+  { fps: 12, quality: 72, maxWidth: 512, maxSeconds: 2 },
+  { fps: 12, quality: 68, maxWidth: 512, maxSeconds: 2 },
+  { fps: 12, quality: 64, maxWidth: 512, maxSeconds: 2 },
+  { fps: 12, quality: 60, maxWidth: 512, maxSeconds: 2 },
 ]
 
 // NOTE: the fps step below DOWNSAMPLES only — never forces a low-fps GIF
@@ -368,6 +454,10 @@ export async function makeAnimatedSticker(input: Buffer, ext: string): Promise<B
       }
     }
 
+    // Black-border trim, once, before the ladder (rule 7a). Runs on the
+    // (possibly trimmed) encode input so the ladder sees the same frames.
+    const blackCrop = await detectBlackCrop(encodeInput, probe)
+
     let smallest: Buffer | null = null
     let lastKey = ''
     for (const a of LADDER) {
@@ -394,8 +484,16 @@ export async function makeAnimatedSticker(input: Buffer, ext: string): Promise<B
       // proportional side even.
       const filters: string[] = []
       if (probe.fps === null || probe.fps > a.fps) filters.push(`fps=${a.fps}`)
+      // Fill the square (rule 7): trim baked-in black borders first,
+      // then scale the SHORT side to 512 and centre-crop to 512x512.
+      // Landscape keeps its full height and loses its sides; portrait
+      // keeps its full width and loses top/bottom. No pad anywhere,
+      // so there is no transparent area left to render as black bars.
+      if (blackCrop) filters.push(`crop=${blackCrop}`)
       filters.push(
-        `scale='if(gt(iw,ih),${a.maxWidth},-2)':'if(gt(iw,ih),-2,${a.maxWidth})':flags=lanczos`
+        `scale='if(gt(iw,ih),-2,512)':'if(gt(iw,ih),512,-2)':flags=lanczos`,
+        'crop=512:512',
+        'format=yuva420p'
       )
       const vf = filters.join(',')
       const args = ['-v', 'error', '-y', '-i', encodeInput]
@@ -409,14 +507,13 @@ export async function makeAnimatedSticker(input: Buffer, ext: string): Promise<B
         // default preset, and ~6% smaller at the same quality on busy
         // motion (measured). One rung of size headroom for free.
         '-preset', 'picture',
-        // Conditional replenishment: skips re-encoding near-static blocks,
-        // so GIFs with still regions use fewer bytes and can stay on the
-        // early rungs. (It does nothing for full-motion content — for those
-        // the fps/width rungs below are what bring the size down.)
-        '-cr_threshold', '4',
-        '-cr_size', '16',
+        // No -cr_threshold on purpose (flicker rule 8): conditional
+        // replenishment leaves stale blocks that flash on Telegram
+        // video stickers. Default 0 = every block re-encoded.
         '-loop', '0',
-        '-an', '-vsync', '0',
+        // cfr, not passthrough (flicker rule 8): even frame spacing
+        // at the rung's fps, instead of the source's uneven timestamps.
+        '-an', '-vsync', 'cfr',
         out
       )
       await execFileAsync('ffmpeg', args, { timeout: 120_000 })

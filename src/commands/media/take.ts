@@ -40,9 +40,34 @@ function isAnimatedWebp(buf: Buffer): boolean {
  *
  * Naming: !take My Pack | Ashar   (one-off override)
  * Or save names once with !setname and every !take carries them.
+ *
+ * FIX (staged): the old code downloaded once and, on any failure, replied
+ * "Failed to download that media" with no way forward. Two real causes:
+ *  1. Transient network blips — fixed by retrying twice before giving up.
+ *  2. Expired media — WhatsApp deletes message media from its servers
+ *     after a while, and the bot has no re-upload channel, so an old
+ *     quoted sticker can never be fetched again. The error now says
+ *     this plainly and tells the user the actual fix: forward/re-send
+ *     the sticker fresh and reply !take to the new copy.
+ * A companion staged change in src/core/messageHandler.ts peels the
+ * ephemeralMessage wrapper off quoted messages, so !take also works on
+ * stickers quoted inside disappearing-message chats (previously the
+ * quoted type came through as "ephemeralMessage" and no download was
+ * ever wired up for it).
  */
 const handler = async (m: ParsedMessage, { sock, db }: CommandContext) => {
   try {
+    // Quoted message wrapped by a disappearing-message chat: the inner
+    // media is unreachable through the old parse path. The staged
+    // messageHandler fix peels this wrapper; if it is not applied yet,
+    // say so instead of a misleading "reply to a sticker" error.
+    if (m.quoted && m.quoted.type === 'ephemeralMessage') {
+      return m.reply(
+        'That message sits inside a disappearing-message chat, so the bot cannot reach the quoted media this way.\n\n' +
+        'Forward the sticker to this chat (or turn disappearing messages off for it) and reply *!take* to the fresh copy.'
+      )
+    }
+
     const mediaMsg = findMedia(m)
     if (!mediaMsg) {
       return m.reply(
@@ -54,9 +79,20 @@ const handler = async (m: ParsedMessage, { sock, db }: CommandContext) => {
 
     await m.reply(global.mess.wait)
 
-    const media = await mediaMsg.download?.()
+    // Retry twice: one failed fetch is often a transient blip, not a
+    // dead message. Only after all retries fail do we conclude the
+    // media itself is gone.
+    let media: MediaDownloadResult | null | undefined
+    for (let attempt = 0; attempt < 3; attempt++) {
+      media = await mediaMsg.download?.()
+      if (media) break
+      if (attempt < 2) await new Promise(r => setTimeout(r, 1500))
+    }
     if (!media) {
-      return m.reply('Failed to download that media. Try again with a different one.')
+      return m.reply(
+        'Could not download that media, even after retrying.\n\n' +
+        'Most likely cause: the message is too old and WhatsApp has already deleted its media from their servers — the bot cannot fetch it back. Forward the sticker to this chat (or re-send it) and reply *!take* to the fresh copy, and it will work.'
+      )
     }
 
     // Resolve names: inline override > saved defaults > built-in default

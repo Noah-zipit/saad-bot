@@ -2,7 +2,7 @@ import { Sticker } from 'wa-sticker-formatter'
 import { fileTypeFromBuffer } from 'file-type'
 import type { ParsedMessage, CommandContext, MediaDownloadResult } from '../../core/types.js'
 import { getStickerDefaults, parseNameArgs, rawArgsText } from '../../lib/stickerNames.js'
-import { makeAnimatedSticker, addStickerMetadata } from '../../lib/animatedSticker.js'
+import { makeAnimatedSticker, addStickerMetadata, validateAnimatedSticker, sourceToGifVideo } from '../../lib/animatedSticker.js'
 
 type MediaMsg = { type: string; download?: () => Promise<MediaDownloadResult | null> }
 
@@ -66,6 +66,22 @@ const handler = async (m: ParsedMessage, { sock, db }: CommandContext) => {
       // Stamp the pack name back in — the ffmpeg encoder never wrote EXIF,
       // which is why GIF stickers showed no name underneath.
       stickerBuffer = await addStickerMetadata(raw, { id: Date.now().toString(), pack, author })
+      // Safety net (2026-10-24, same as !gif): !s previously sent animated
+      // output unchecked, so a non-512x512 or malformed encode reached the
+      // phone as the split/black-bar glitch. Never send that — fall back
+      // to the source as a normal looping GIF instead.
+      const check = validateAnimatedSticker(stickerBuffer)
+      if (!check.ok || stickerBuffer.length > 512 * 1024) {
+        console.warn(`[sticker] animated sticker failed validation (${check.reason || 'oversize'}), falling back to gif video`)
+        try {
+          const gifVideo = await sourceToGifVideo(media.buffer, ext)
+          await sock.sendMessage(m.chat, { video: gifVideo, gifPlayback: true }, { quoted: m.message })
+          await m.reply('That one would not display as a sticker, so I sent it as a normal GIF instead.')
+        } catch {
+          await m.reply('Failed to turn that into a sticker. Make sure it is a GIF under ~10MB and try again.')
+        }
+        return
+      }
     } else {
       const stickerOptions = {
         pack,

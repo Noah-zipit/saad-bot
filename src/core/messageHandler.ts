@@ -15,6 +15,10 @@ import {
   participantPn
 } from '../lib/jidUtils.js'
 import { unwrapViewOnceMessage, VIEW_ONCE_MEDIA_TYPES } from '../lib/viewOnce.js'
+import { isTalkbackEnabled } from '../lib/talkbackStore.js'
+import { talkbackReply } from '../lib/talkbackReplies.js'
+import { talkbackAiReply } from '../lib/talkbackAi.js'
+import { getAfk, clearAfk, formatAfkSince } from '../lib/afkStore.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const tmpDir = path.join(__dirname, '../../tmp')
@@ -120,6 +124,61 @@ export async function handleMessage(message: WAMessage, sock: WASocket, db: Data
     return
   }
 
+  // --- Antilink (staged): enforces the existing group.settings.antiLink
+  // toggle (!settings antilink on / !antilink on). Non-admins posting a
+  // WhatsApp group invite link get the message deleted (bot must be admin
+  // to delete) plus a warning. Admins and the owner are exempt. The
+  // message is dropped here so it never reaches command handling.
+  if (m.isGroup && !m.fromMe && !m.isOwner && m.body) {
+    try {
+      const group = db.getGroup(m.chat)
+      if (group.settings.antiLink && /chat\.whatsapp\.com\/[A-Za-z0-9]{10,}/i.test(m.body)) {
+        const senderIsAdmin = await isAdmin(m.sender, m.chat, sock)
+        if (!senderIsAdmin) {
+          const botIsAdmin = await isBotAdmin(m.chat, sock)
+          if (botIsAdmin) {
+            await sock.sendMessage(m.chat, { delete: message.key })
+            await sock.sendMessage(m.chat, {
+              text: `⚠️ @${digitsOf(m.sender)} — group invite links are not allowed here.`,
+              mentions: [m.sender]
+            })
+          } else {
+            await m.reply('⚠️ Group invite links are not allowed here, but I need admin rights to delete them. Ask a group admin to make me admin.')
+          }
+          return
+        }
+      }
+    } catch (e) {
+      console.error('[antilink] failed:', e)
+    }
+  }
+
+  // --- AFK (staged): auto-clear when the AFK user speaks again, and tell
+  // people who tag an AFK user. Non-command messages only, so !afk itself
+  // still manages its own state; own messages are skipped (no self-reply).
+  const cmdPrefix = global.prefix || '!'
+  const isCommandMsg = !!(m.body && m.body.startsWith(cmdPrefix))
+  if (!m.fromMe && !isCommandMsg) {
+    try {
+      const mine = await getAfk(m.sender)
+      if (mine) {
+        await clearAfk(m.sender)
+        await m.reply(`Welcome back, ${m.pushName}! You were AFK${mine.reason ? ` — ${mine.reason}` : ''}.`)
+      } else if (m.mentionedJid.length > 0) {
+        for (const jid of m.mentionedJid) {
+          const afk = await getAfk(jid)
+          if (afk) {
+            await sock.sendMessage(m.chat, {
+              text: `💤 *${digitsOf(jid)} is AFK*${afk.reason ? `\n${afk.reason}` : ''}\n_Since ${formatAfkSince(afk.since)}_`
+            }, { quoted: message })
+          }
+        }
+      }
+    } catch (e) {
+      console.error('[afk] failed:', e)
+    }
+  }
+
   // --- Anti view-once: save incoming view-once photos/videos/voice notes and
   // re-send them as normal messages so they stay viewable (owner asked for this).
   if (m.viewOnce && VIEW_ONCE_MEDIA_TYPES.includes(m.viewOnce.type)) {
@@ -216,6 +275,32 @@ export async function handleMessage(message: WAMessage, sock: WASocket, db: Data
         break
       }
     }
+  } else if (!m.fromMe && m.body && (m.type === 'conversation' || m.type === 'extendedTextMessage')) {
+    // Talkback mode (staged): when a chat has !talkback on, the bot replies
+    // to plain chat messages. Commands never reach here (they take the branch
+    // above). Own messages are skipped so the bot can never reply to itself.
+    // In groups it only answers when tagged or replied to, so it cannot
+    // flood a busy group; in a DM it answers every message.
+    try {
+      if (await isTalkbackEnabled(m.chat)) {
+        const botDigits = digitsOf(decodeJid(sock.user?.id ?? '') ?? '')
+        const mentionedBot = botDigits
+          ? m.mentionedJid.some(j => digitsOf(j) === botDigits)
+          : false
+        const quotedBot = botDigits && m.quoted
+          ? digitsOf(m.quoted.sender) === botDigits
+          : false
+        if (!m.isGroup || mentionedBot || quotedBot) {
+          // AI first (NVIDIA NIM, per-chat history); built-in replies
+          // are the fallback when no key is set or the API call fails,
+          // so talkback never goes silent because of an API problem.
+          const aiReply = await talkbackAiReply(m.chat, m.body, m.pushName)
+          await m.reply(aiReply ?? talkbackReply(m.body, m.pushName))
+        }
+      }
+    } catch (e) {
+      console.error('[talkback] failed:', e)
+    }
   }
 }
 
@@ -258,7 +343,14 @@ async function parseMessage(message: WAMessage, sock: WASocket): Promise<ParsedM
 
   // Get quoted message if any
   let quoted: ParsedQuoted | undefined
-  const quotedMessage = inner.extendedTextMessage?.contextInfo?.quotedMessage
+  let quotedMessage = inner.extendedTextMessage?.contextInfo?.quotedMessage
+  // STAGED FIX: disappearing-message chats wrap the quoted message in an
+  // ephemeralMessage envelope. Without peeling it, quotedType comes out
+  // as "ephemeralMessage", no download is ever wired up, and commands
+  // like !take / !sticker fail on quoted media in those chats.
+  while (quotedMessage && Object.keys(quotedMessage)[0] === 'ephemeralMessage') {
+    quotedMessage = (quotedMessage as Record<string, any>).ephemeralMessage?.message
+  }
   if (type === 'extendedTextMessage' && quotedMessage) {
     const quotedType = Object.keys(quotedMessage)[0] ?? ''
     quoted = {
@@ -271,7 +363,9 @@ async function parseMessage(message: WAMessage, sock: WASocket): Promise<ParsedM
     // NOTE: stickerMessage MUST be in this list — !take's main use case is
     // replying to a sticker, and without it quoted.download stays undefined
     // and the command fails with "Failed to download that media."
-    if (quotedType === 'imageMessage' || quotedType === 'videoMessage' || quotedType === 'stickerMessage') {
+    // NOTE: audioMessage is in this list so !vv can reveal a bare quoted
+    // voice note (clients that strip the view-once wrapper in replies).
+    if (quotedType === 'imageMessage' || quotedType === 'videoMessage' || quotedType === 'stickerMessage' || quotedType === 'audioMessage') {
       const quotedWamsg = { key: message.key, message: quotedMessage } as WAMessage
       quoted.download = () => downloadToTmp(quotedWamsg, quotedType)
     } else {
