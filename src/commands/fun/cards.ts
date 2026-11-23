@@ -114,13 +114,12 @@ const handler = async (m: ParsedMessage, { args, sock }: CommandContext) => {
           `⏳ Your next pack is ready in *${formatWait(result.waitMs)}*.\n\nPacks are free, once an hour. Meanwhile, try *!duel @user* or *!trade*.`
         )
       }
-      const lines = result.cards.map(c => formatCard(c)).join('\n')
       const best = result.cards.reduce((a, b) => (b.power > a.power ? b : a))
       const lucky = best.rarity === 'Epic' || best.rarity === 'Legendary' ? `\n\n${RARITY_EMOJI[best.rarity]} Nice pull — a ${best.rarity}!` : ''
       for (const c of result.cards) {
         await sendCard(c, formatCardFull(c))
       }
-      return m.reply(`*🎴 PACK OPENED* (+10 🪙)\n\n${lines}${lucky}`)
+      return m.reply(`*🎴 PACK OPENED* (+10 🪙)${lucky}`)
     }
 
     // ---- !trade ----

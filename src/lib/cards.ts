@@ -196,7 +196,7 @@ export function formatCard(c: CardDef, count?: number): string {
   return `${RARITY_EMOJI[c.rarity]} *${c.name}* — ${c.rarity}, ⚔️ ${c.power}${dup}`
 }
 
-/** Full card line for image captions: adds series + shoob.gg credit page. */
+/** Full card line for image captions: adds the series, no link. */
 export function formatCardFull(c: CardDef): string {
-  return `${formatCard(c)}\n_${c.series}_\n${c.page}`
+  return `${formatCard(c)}\n_${c.series}_`
 }
