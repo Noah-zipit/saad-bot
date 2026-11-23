@@ -22,6 +22,7 @@ import {
   DUEL_WIN_COINS,
   DUEL_LOSE_COINS
 } from '../../lib/cardStore.js'
+import { startTradeFlow } from '../../lib/tradeFlow.js'
 
 /**
  * Card game — REAL Shoob cards (shoob.gg), same source as CardKami.
@@ -127,16 +128,29 @@ const handler = async (m: ParsedMessage, { args, sock }: CommandContext) => {
       const partner = m.mentionedJid[0] ?? m.quoted?.sender
       if (!partner) {
         return m.reply(
-          'Trade with a reply or a tag.\n\n' +
-          'Reply to their message with:\n*!trade All Might | Son Goku*\n\n' +
-          'Or tag them:\n*!trade @user All Might | Son Goku*\n\n' +
-          'You give the first card, they give the second. Both must own their card.'
+          'Trade by tapping — no typing needed.\n\n' +
+          'Tag someone:\n*!trade @user*\n\n' +
+          'Then tap the card you give, tap the card you want, and they tap Accept.\n\n' +
+          'You can still type it the old way:\n*!trade @user All Might | Son Goku*'
         )
       }
+      if (sameUser(partner, m.sender)) return m.reply('You cannot trade with yourself.')
       let rest = args.join(' ').trim()
       if (m.mentionedJid.length > 0) rest = rest.replace(/^@\S+\s*/, '')
-      const parts = rest.split('|').map(s => s.trim())
-      if (parts.length !== 2 || !parts[0] || !parts[1]) {
+      const parts = rest.split('|').map(s => s.trim()).filter(Boolean)
+      if (parts.length === 0) {
+        // Tap flow: pick the give card, then the want card, partner confirms.
+        await startTradeFlow(m, sock, partner)
+        return
+      }
+      if (parts.length === 1) {
+        // One card named: start the tap flow with it as the give card.
+        const give = findCard(parts[0])
+        if (!give) return m.reply(`I do not know a card called "${parts[0].slice(0, 100)}".`)
+        await startTradeFlow(m, sock, partner, give.id)
+        return
+      }
+      if (parts.length !== 2) {
         return m.reply('Use two card names separated by | .\n\nExample: *!trade All Might | Son Goku*')
       }
       const myCard = findCard(parts[0])

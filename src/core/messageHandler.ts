@@ -17,6 +17,7 @@ import {
   participantPn
 } from '../lib/jidUtils.js'
 import { unwrapViewOnceMessage, VIEW_ONCE_MEDIA_TYPES } from '../lib/viewOnce.js'
+import { handleTradeInteraction, handleTradeMenuReply } from '../lib/tradeFlow.js'
 import { isTalkbackEnabled } from '../lib/talkbackStore.js'
 import { talkbackReply } from '../lib/talkbackReplies.js'
 import { talkbackAiReply } from '../lib/talkbackAi.js'
@@ -247,6 +248,28 @@ export async function handleMessage(message: WAMessage, sock: WASocket, db: Data
     }
   }
 
+  // Interactive replies (list / button taps) route to the trade flow
+  // before anything else — they carry no command text.
+  if (m.type === 'listResponseMessage' || m.type === 'buttonsResponseMessage') {
+    try {
+      if (await handleTradeInteraction(m, sock)) return
+    } catch (e) {
+      console.error('[trade-interaction] failed:', e)
+    }
+    return
+  }
+
+  // Numbered-menu replies for a trade in menu mode (plain "1", "2" ...)
+  // are consumed here, before commands and talkback — and not gated on
+  // !fromMe, since the owner's own phone taps count too.
+  if ((m.type === 'conversation' || m.type === 'extendedTextMessage') && m.body) {
+    try {
+      if (await handleTradeMenuReply(m, sock)) return
+    } catch (e) {
+      console.error('[trade-menu] failed:', e)
+    }
+  }
+
   // Process command if this is a command
   const prefix = global.prefix || '!'
   if (m.body && m.body.startsWith(prefix)) {
@@ -357,6 +380,11 @@ async function parseMessage(message: WAMessage, sock: WASocket): Promise<ParsedM
     body = inner.imageMessage?.caption || ''
   } else if (type === 'videoMessage') {
     body = inner.videoMessage?.caption || ''
+  } else if (type === 'listResponseMessage') {
+    // Tap on a list row (trade flow): the row id is the selection.
+    body = inner.listResponseMessage?.singleSelectReply?.selectedRowId || ''
+  } else if (type === 'buttonsResponseMessage') {
+    body = inner.buttonsResponseMessage?.selectedButtonId || ''
   }
 
   const chat = decodeJid(message.key.remoteJid) ?? ''
